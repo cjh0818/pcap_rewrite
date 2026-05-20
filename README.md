@@ -1,4 +1,4 @@
-# pcap_rewrite — PCAP/PCAPNG 批量 IP 改写工具（工程化版本）
+# pcap_rewrite — PCAP/PCAPNG 批量 IP 改写工具
 
 对 `.pcap` / `.pcapng` 文件中的 IPv4 地址进行**协议感知**的批量替换，覆盖
 L2（ARP）、L3（IP header）、L4（ICMP/TCP/UDP）以及常见明文应用层协议（HTTP、TLS SNI、
