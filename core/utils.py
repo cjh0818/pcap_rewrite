@@ -183,7 +183,7 @@ def replace_binary_ipv4(payload, args):
     return payload.replace(args.old_ip_bin, args.new_ip_bin), True
 
 
-def replace_payload_literals(payload, args):
+def general_replace_payload(payload, args):
     """
     对无专用 handler 的 payload 执行文本(ASCII)和二进制(4字节)兜底替换。
     :param payload: 协议负载字节串
@@ -191,17 +191,19 @@ def replace_payload_literals(payload, args):
     :return: (新payload, 是否变化, 标签字符串)
     """
     labels = []
-    out = payload
+    new_payload = payload
     # 先尝试 ASCII 文本替换（如 b"10.0.0.1"）
-    if args.old_ip_bytes in out:
-        out = out.replace(args.old_ip_bytes, args.new_ip_bytes)
+    if args.old_ip_bytes in new_payload:
+        new_payload = new_payload.replace(args.old_ip_bytes, args.new_ip_bytes)
         labels.append("ascii")
     # 再尝试 packed 二进制替换（4 字节大端 IP）
-    out2, bin_changed = replace_binary_ipv4(out, args)
+    binary_payload, bin_changed = replace_binary_ipv4(new_payload, args)
     if bin_changed:
-        out = out2
+        new_payload = binary_payload
         labels.append("binary")
-    return out, out != payload, "+".join(labels) if labels else "unchanged"
+    is_changed = new_payload != payload
+    change_labels = "+".join(labels) if labels else "unchanged"
+    return new_payload, is_changed, change_labels
 
 
 # =============================================================================

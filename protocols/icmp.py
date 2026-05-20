@@ -5,7 +5,7 @@ ICMP 协议改写：处理 ICMP payload 及差错报文中的被引用 IPv4 head
 
 from loguru import logger
 from scapy.layers.inet import ICMP, IP, IPerror
-from core.utils import clear_autofields, replace_payload_literals, safe_delattr, set_l4_payload
+from core.utils import clear_autofields, general_replace_payload, safe_delattr, set_l4_payload
 
 
 def rewrite_icmp(packet, index, args, stats):
@@ -34,12 +34,14 @@ def rewrite_icmp(packet, index, args, stats):
             quoted.dst = args.new_ip
             changed = True
         if changed:
+            # 修改了被引用的 IP header 后需要清理其长度/校验和字段，交由 Scapy 重算
             safe_delattr(quoted, ("len", "chksum"))
     else:
         # 非差错 ICMP（如 Echo Request/Reply）：对 payload 做文本/二进制替换
         old_payload = bytes(icmp.payload)
-        new_payload, payload_changed, label = replace_payload_literals(old_payload, args)
+        new_payload, payload_changed, label = general_replace_payload(old_payload, args)
         if payload_changed:
+            # 替换 ICMP payload 后需要清理 ICMP 长度/校验和字段，交由 Scapy 重算
             set_l4_payload(icmp, new_payload)
             changed = True
             logger.info(f"帧#{index} ICMP payload[{label}] {len(old_payload)}->{len(new_payload)}")

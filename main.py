@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-pcap_rewrite - PCAP/PCAPNG 批量 IP 改写工具（工程化版本）。
+pcap_rewrite - PCAP/PCAPNG 批量 IP 改写工具
 用法:
     python main.py <input_dir> <old_ip> <new_ip> [选项]
 示例:
@@ -32,7 +32,7 @@ def output_path_for(input_file, input_dir, output_dir):
 
 def iter_pcap_files(input_dir, output_dir):
     """
-    遍历输入目录中的 .pcap/.pcapng 文件（始终递归）。
+    递归遍历输入目录中的 .pcap/.pcapng 文件。
     自动跳过位于输出目录内的文件，避免二次处理。
     """
     iterator = input_dir.rglob("*")
@@ -141,9 +141,9 @@ def process_directory(args):
 def parse_args(argv=None):
     """解析命令行参数。"""
     parser = argparse.ArgumentParser(
-        description="批量重写 PCAP/PCAPNG 中 L2/L3/L4/应用层 的 IPv4 字符串/二进制值，并修正 TCP seq/ack/SACK。"
+        description="批量替换 PCAP/PCAPNG 中 L2/L3/L4/应用层 的 IPv4 字符串/二进制值，并修正 TCP seq/ack/SACK。"
     )
-    parser.add_argument("input_dir", help="输入目录路径，自动处理其中所有 .pcap/.pcapng 文件")
+    parser.add_argument("input_dir", help="输入目录路径，递归处理其中所有 .pcap/.pcapng 文件")
     parser.add_argument("old_ip", help="待替换的旧 IPv4，例如 1.1.1.1")
     parser.add_argument("new_ip", help="替换后的新 IPv4，例如 192.168.100.200")
     parser.add_argument("-o", "--output-dir", help="输出目录；默认在输入目录下创建 iprewrite_output")

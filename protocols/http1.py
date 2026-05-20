@@ -9,7 +9,7 @@ import zlib
 
 from core.context import RewriteError, RewriteResult
 from core.dispatcher import ProtocolHandler
-from core.utils import replace_payload_literals
+from core.utils import general_replace_payload
 from config import (
     HTTP_HEADER_END,
     HTTP2_CONNECTION_PREFACE,
@@ -507,7 +507,7 @@ def rewrite_http1_stream_safe(stream, ctx, args):
             break
 
         if not looks_like_http1(rest):
-            new_tail, tail_changed, label = replace_payload_literals(rest, args)
+            new_tail, tail_changed, label = general_replace_payload(rest, args)
             if tail_changed:
                 changed = True
                 labels.append(f"tail.{label}")
