@@ -11,28 +11,18 @@ TCP 重分段、ACK 克隆与 SEQ/ACK/SACK 修正。
 
 import copy
 from decimal import Decimal
-
 from loguru import logger
-
 from scapy.layers.inet import IP, TCP
-
 from core.context import TcpRewritePlan
 from core.flow import reverse_flow_key
-from core.utils import (
-    clear_autofields,
-    map_offset,
-    real_tcp_payload,
-    seq_add,
-    seq_offset,
-    set_l4_payload,
-)
-from config import TCP_FLAG_ACK, TCP_FLAG_PSH, TCP_FLAG_FIN
+from core.utils import clear_autofields, map_offset, real_tcp_payload, seq_add, seq_offset, set_l4_payload
+from config import TCP_FLAG_ACK, TCP_FLAG_PSH, TCP_FLAG_FIN, DEFAULT_MAX_FRAME_LEN, DEFAULT_TCP_MAX_PAYLOAD
 
 
-def tcp_payload_capacity(packet, args):
+def tcp_payload_capacity(packet):
     """
     计算当前 TCP 包可承载的最大 payload 字节数。
-    取 --tcp-max 和链路层帧长限制的较小值。
+    取 TCP 最大 payload 和链路层帧长限制的较小值。
     """
     if TCP not in packet:
         return 0
@@ -40,8 +30,8 @@ def tcp_payload_capacity(packet, args):
     # header_len = 整个包长度 - 真实 TCP payload 长度
     header_len = len(bytes(packet)) - len(payload)
     # 链路层最长帧长限制
-    by_frame = max(0, args.max_frame_len - header_len)
-    return max(0, min(args.tcp_max, by_frame))
+    by_frame = max(0, DEFAULT_MAX_FRAME_LEN - header_len)
+    return max(0, min(DEFAULT_TCP_MAX_PAYLOAD, by_frame))
 
 
 def is_pure_ack(packet):
@@ -155,7 +145,7 @@ def assign_insert_times(insert_after, packets, deleted_indices):
                 logger.debug(f"新增 TCP 包时间戳分配失败，保留模板时间: {exc}")
 
 
-def resegment_tcp_flow(flow, packets, packet_keys, args, plan):
+def resegment_tcp_flow(flow, packets, packet_keys, plan):
     """
     把改写后的 TCP 字节流(new_stream)重新切回物理包。
 
@@ -176,7 +166,7 @@ def resegment_tcp_flow(flow, packets, packet_keys, args, plan):
     last_primary = primary_segments[-1]
     last_packet = packets[last_primary.index]
     last_flags = int(last_packet[TCP].flags)
-    last_capacity = tcp_payload_capacity(last_packet, args)
+    last_capacity = tcp_payload_capacity(last_packet)
     if last_capacity <= 0:
         logger.warning(f"TCP流{flow.key} 最后一片容量为 0，跳过重分段")
         return
@@ -184,7 +174,7 @@ def resegment_tcp_flow(flow, packets, packet_keys, args, plan):
     # ---- 第一阶段：填充已有包 ----
     for meta in primary_segments:
         packet = packets[meta.index]
-        capacity = tcp_payload_capacity(packet, args)
+        capacity = tcp_payload_capacity(packet)
         if capacity <= 0:
             continue
         chunk = flow.new_stream[cursor:cursor + capacity]
@@ -256,7 +246,7 @@ def resegment_tcp_flow(flow, packets, packet_keys, args, plan):
             plan.deleted_indices.add(ack_index)
 
 
-def remap_retransmissions(flow, packets, args, plan):
+def remap_retransmissions(flow, packets, plan):
     """
     把非主片（重传片）的 payload 映射到新流坐标。
     根据 edits 区间将旧偏移映射为新偏移，取 new_stream 对应片段。
@@ -273,7 +263,7 @@ def remap_retransmissions(flow, packets, args, plan):
             plan.deleted_indices.add(meta.index)
             continue
 
-        capacity = tcp_payload_capacity(packet, args)
+        capacity = tcp_payload_capacity(packet)
         if capacity <= 0:
             continue
         chunks = [new_payload[pos:pos + capacity] for pos in range(0, len(new_payload), capacity)]
@@ -388,7 +378,7 @@ def direction_key_for_inserted(packet, nearby_key):
     return conn_id, packet[IP].src, int(packet[TCP].sport), packet[IP].dst, int(packet[TCP].dport)
 
 
-def resegment_tcp_flows(flows, packets, packet_keys, args, stats):
+def resegment_tcp_flows(flows, packets, packet_keys, stats):
     """
     对所有已改写的 TCP 流执行重分段计划。
     包括：主片重分段、重传片映射、时间戳分配、统计更新。
@@ -398,8 +388,8 @@ def resegment_tcp_flows(flows, packets, packet_keys, args, stats):
         if not flow.edits and flow.new_stream == flow.old_stream:
             continue
         plan.modified_flows[key] = flow
-        resegment_tcp_flow(flow, packets, packet_keys, args, plan)
-        remap_retransmissions(flow, packets, args, plan)
+        resegment_tcp_flow(flow, packets, packet_keys, plan)
+        remap_retransmissions(flow, packets, plan)
         stats.tcp_stream_changed += 1
         if flow.conflicts:
             logger.warning(f"TCP流{key} 存在 {flow.conflicts} 个重叠冲突字节，已按首个有效片优先处理")

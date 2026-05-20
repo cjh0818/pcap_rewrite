@@ -6,9 +6,7 @@
 import argparse
 import difflib
 import ipaddress
-
 from loguru import logger
-
 from scapy.layers.inet import ICMP, IP, TCP, UDP
 from scapy.packet import Raw
 from config import TCP_SEQ_MOD, TCP_SEQ_HALF, HTTP_HEADER_END
@@ -180,8 +178,6 @@ def replace_binary_ipv4(payload, args):
     :param args: 命令行参数对象
     :return: (新payload, 是否发生了变化)
     """
-    if args.no_binary_raw:
-        return payload, False
     if args.old_ip_bin not in payload:
         return payload, False
     return payload.replace(args.old_ip_bin, args.new_ip_bin), True
@@ -198,8 +194,6 @@ def replace_payload_literals(payload, args):
     out = payload
     # 先尝试 ASCII 文本替换（如 b"10.0.0.1"）
     if args.old_ip_bytes in out:
-        if args.no_raw:
-            return payload, False, "raw.disabled"
         out = out.replace(args.old_ip_bytes, args.new_ip_bytes)
         labels.append("ascii")
     # 再尝试 packed 二进制替换（4 字节大端 IP）

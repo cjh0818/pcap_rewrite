@@ -10,29 +10,15 @@
 
 import traceback
 import zlib
-
 from loguru import logger
-
 from scapy.layers.inet import IP, TCP, UDP
-
 from core.context import RewriteContext, RewriteError, TcpRewritePlan
 from core.flow import collect_tcp_flows
-from core.resegment import (
-    apply_tcp_sequence_adjustments,
-    resegment_tcp_flows,
-)
-from core.utils import (
-    compute_edits,
-    real_udp_payload,
-    replace_binary_ipv4,
-    set_l4_payload,
-    clear_autofields,
-)
+from core.resegment import apply_tcp_sequence_adjustments, resegment_tcp_flows
+from core.utils import compute_edits, real_udp_payload, replace_binary_ipv4, set_l4_payload, clear_autofields
 from protocols import TCP_DISPATCHER, UDP_DISPATCHER
-from protocols.http1 import (
-    rewrite_http1_stream_safe,
-)
-from config import HTTP_REQUEST_RE, HTTP_RESPONSE_RE
+from protocols.http1 import rewrite_http1_stream_safe
+from config import HTTP_REQUEST_RE, HTTP_RESPONSE_RE, DEFAULT_UDP_MAX_PAYLOAD
 
 
 # =============================================================================
@@ -67,9 +53,9 @@ def rewrite_udp_packet(packet, index, args, stats):
 
     if not changed:
         return
-    if len(new_payload) > args.udp_max:
+    if len(new_payload) > DEFAULT_UDP_MAX_PAYLOAD:
         stats.failures += 1
-        logger.error(f"帧#{index} UDP payload 超过阈值 {len(new_payload)}>{args.udp_max}，已回滚")
+        logger.error(f"帧#{index} UDP payload 超过阈值 {len(new_payload)}>{DEFAULT_UDP_MAX_PAYLOAD}，已回滚")
         return
 
     set_l4_payload(udp, new_payload)
@@ -89,8 +75,10 @@ def rewrite_l2_l3_udp_pass(packets, args, stats):
 
     for index, packet in enumerate(packets, start=1):
         stats.total_in += 1
+        # 优先处理下层的 ARP 协议，ARP 协议上层没有其他协议，改写后跳过后续 L3/L4 处理
         if rewrite_arp(packet, index, args, stats):
             continue
+        # 处理 IPv4 的 src/dst 字段，改写后继续处理 ICMP/UDP 协议
         rewrite_ipv4_header(packet, index, args, stats)
         if rewrite_icmp(packet, index, args, stats):
             continue
@@ -181,7 +169,7 @@ def rewrite_tcp_pass(packets, args, stats):
     if not changed_count:
         return TcpRewritePlan()
 
-    plan = resegment_tcp_flows(flows, packets, packet_keys, args, stats)
+    plan = resegment_tcp_flows(flows, packets, packet_keys, stats)
     apply_tcp_sequence_adjustments(packets, packet_keys, plan)
     return plan
 

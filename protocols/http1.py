@@ -9,7 +9,7 @@ import zlib
 
 from core.context import RewriteError, RewriteResult
 from core.dispatcher import ProtocolHandler
-from core.utils import find_http_header_end, replace_payload_literals
+from core.utils import replace_payload_literals
 from config import (
     HTTP_HEADER_END,
     HTTP2_CONNECTION_PREFACE,
@@ -511,8 +511,6 @@ def rewrite_http1_stream_safe(stream, ctx, args):
             if tail_changed:
                 changed = True
                 labels.append(f"tail.{label}")
-            elif ctx.old_ip in rest and args.no_raw:
-                return RewriteResult(False, False, stream, "http1.stream", "http.tail_raw_disabled")
             output.extend(new_tail)
             break
 

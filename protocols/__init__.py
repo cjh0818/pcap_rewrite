@@ -1,12 +1,11 @@
 # -*- coding: utf-8 -*-
 """
-协议模块：注册所有 L7 协议 handler 并构造 TCP/UDP 分发器。
+协议模块：注册所有应用层协议 handler 并构造 TCP/UDP 分发器。
 
 注册顺序非常重要：越结构化、越安全的 handler 越靠前；raw 必须最后。
 """
 
 from core.dispatcher import HandlerDispatcher
-
 from protocols.websocket import WebSocketHandler
 from protocols.tls_sni import TLSClientHelloSNIHandler
 from protocols.http2 import HTTP2RejectHandler

@@ -7,13 +7,7 @@
 
 from core.context import RewriteResult
 from core.dispatcher import ProtocolHandler
-from config import (
-    SSH_BANNER_RE,
-    FTP_GREETING_RE,
-    SMTP_GREETING_RE,
-    POP3_GREETING_RE,
-    IMAP_GREETING_RE,
-)
+from config import SSH_BANNER_RE, FTP_GREETING_RE, SMTP_GREETING_RE, POP3_GREETING_RE, IMAP_GREETING_RE
 
 
 class KnownUnsupportedTextHandler(ProtocolHandler):

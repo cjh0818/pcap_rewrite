@@ -9,9 +9,7 @@ TCP 流标识生成、按 SYN 分代、流收集与字节流重组。
 """
 
 from collections import defaultdict
-
 from scapy.layers.inet import IP, TCP
-
 from core.context import SegmentMeta, TcpFlowState
 from core.utils import real_tcp_payload, seq_offset
 from config import TCP_FLAG_SYN, TCP_FLAG_ACK

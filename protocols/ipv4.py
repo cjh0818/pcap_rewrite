@@ -4,9 +4,7 @@ IPv4 header 改写：替换 IP 层 src/dst 地址字段。
 """
 
 from loguru import logger
-
 from scapy.layers.inet import IP, TCP, UDP
-
 from core.utils import clear_autofields
 
 

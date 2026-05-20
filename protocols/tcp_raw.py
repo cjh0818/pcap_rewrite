@@ -19,12 +19,9 @@ class RawTCPHandler(ProtocolHandler):
 
     def rewrite(self, payload, ctx):
         """
-        对 TCP payload 执行 ASCII 文本和 packed 二进制替换。
-        如果 --no-raw 开启且 payload 含旧 IP，则拒绝改写。
+        对 TCP payload 执行 ASCII 文本替换。
         """
         if ctx.old_ip not in payload:
             return RewriteResult(True, False, payload, self.name)
-        if not ctx.allow_raw:
-            return RewriteResult(False, False, payload, "tcp.raw.disabled", "old_ip_in_raw_payload")
         new_payload = payload.replace(ctx.old_ip, ctx.new_ip)
         return RewriteResult(True, True, new_payload, self.name)

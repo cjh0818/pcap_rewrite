@@ -4,15 +4,8 @@ ICMP 协议改写：处理 ICMP payload 及差错报文中的被引用 IPv4 head
 """
 
 from loguru import logger
-
 from scapy.layers.inet import ICMP, IP, IPerror
-
-from core.utils import (
-    clear_autofields,
-    replace_payload_literals,
-    safe_delattr,
-    set_l4_payload,
-)
+from core.utils import clear_autofields, replace_payload_literals, safe_delattr, set_l4_payload
 
 
 def rewrite_icmp(packet, index, args, stats):

@@ -14,7 +14,7 @@ class RewriteError(Exception):
 @dataclass
 class RewriteResult:
     """
-    统一承载 L7 handler 的处理结果，避免每个协议用不同返回格式。
+    统一承载应用层 handler 的处理结果，避免每个协议用不同返回格式。
     :param ok: True 表示 handler 已安全完成；False 表示命中协议但拒绝改写。
     :param changed: True 表示 payload 或协议内部长度字段发生了变化。
     :param payload: handler 输出的协议负载字节串，失败时通常等于输入字节串。
@@ -31,7 +31,7 @@ class RewriteResult:
 @dataclass
 class RewriteContext:
     """
-    为一次 L7 改写传递稳定上下文，避免 handler 直接依赖全局变量。
+    为一次应用层改写传递稳定上下文，避免 handler 直接依赖全局变量。
     :param args: 命令行参数对象，包含 old_ip、new_ip、阈值和开关配置。
     :param ip_layer: Scapy IP 层对象，handler 可读取方向和地址。
     :param transport_layer: Scapy TCP 或 UDP 层对象，用于读取端口和 TCP 状态。
@@ -69,11 +69,6 @@ class RewriteContext:
     def new_ip_bin(self):
         """读取新 IPv4 packed 二进制值。"""
         return self.args.new_ip_bin
-
-    @property
-    def allow_raw(self):
-        """判断是否允许 raw payload 兜底替换。"""
-        return not self.args.no_raw
 
     def sport(self):
         """读取当前传输层源端口。"""

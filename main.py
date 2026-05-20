@@ -2,50 +2,40 @@
 # -*- coding: utf-8 -*-
 """
 pcap_rewrite - PCAP/PCAPNG 批量 IP 改写工具（工程化版本）。
-
 用法:
     python main.py <input_dir> <old_ip> <new_ip> [选项]
-
 示例:
-    python main.py /data/pcaps 10.0.0.1 192.168.1.100 -o /output --tcp-max 1400
+    python main.py /data/pcaps 10.0.0.1 192.168.1.100 -o /output
 """
 
 import argparse
 import traceback
 import time
 from pathlib import Path
-
 from loguru import logger
-
 try:
     from scapy.error import Scapy_Exception
     from scapy.utils import PcapReader, PcapWriter
 except ImportError as exc:
     raise SystemExit("缺少依赖 scapy，请先执行: pip install scapy") from exc
-
-from config import DEFAULT_TCP_MAX_PAYLOAD, DEFAULT_UDP_MAX_PAYLOAD, DEFAULT_MAX_FRAME_LEN
 from stats import PacketStats, merge_stats
 from core.context import RewriteError
-from core.pipeline import (
-    rewrite_l2_l3_udp_pass,
-    rewrite_tcp_pass,
-    build_output_packets,
-)
+from core.pipeline import rewrite_l2_l3_udp_pass, rewrite_tcp_pass, build_output_packets
 from core.utils import validate_ipv4, attach_ip_material
 
 
-def output_path_for(input_file, input_dir, output_dir, suffix):
+def output_path_for(input_file, input_dir, output_dir):
     """根据输入文件路径和输出目录生成输出 PCAP 路径。"""
     relative = input_file.relative_to(input_dir)
-    return output_dir / relative.parent / f"{input_file.stem}{suffix}-{int(time.time())}.pcap"
+    return output_dir / relative.parent / f"{input_file.stem}_iprewrite-{int(time.time())}.pcap"
 
 
-def iter_pcap_files(input_dir, output_dir, recursive):
+def iter_pcap_files(input_dir, output_dir):
     """
-    遍历输入目录中的 .pcap/.pcapng 文件。
+    遍历输入目录中的 .pcap/.pcapng 文件（始终递归）。
     自动跳过位于输出目录内的文件，避免二次处理。
     """
-    iterator = input_dir.rglob("*") if recursive else input_dir.glob("*")
+    iterator = input_dir.rglob("*")
     output_dir_resolved = output_dir.resolve()
     for path in sorted(iterator):
         if not path.is_file():
@@ -71,18 +61,13 @@ def process_pcap_file(input_file, output_file, args):
     logger.info(f"读取: {input_file}")
     with PcapReader(str(input_file)) as reader:
         packets = list(reader)
-
     stats = PacketStats()
-
-    # 阶段一：非 TCP 协议的包级改写
+    # 非 TCP 协议的包级改写
     rewrite_l2_l3_udp_pass(packets, args, stats)
-
-    # 阶段二：TCP 流重组 → 协议改写 → 重分段 → SEQ/ACK 修正
+    # TCP 流重组 → 协议改写 → 重分段 → SEQ/ACK 修正
     plan = rewrite_tcp_pass(packets, args, stats)
-
-    # 阶段三：按删除/插入计划生成最终输出
+    # 生成最终输出
     output_packets = build_output_packets(packets, plan, stats)
-
     output_file.parent.mkdir(parents=True, exist_ok=True)
     writer = PcapWriter(str(output_file), append=False, sync=True)
     try:
@@ -114,11 +99,10 @@ def process_directory(args):
         if args.output_dir
         else input_dir / "iprewrite_output"
     )
-    files = list(iter_pcap_files(input_dir, output_dir, args.recursive))
+    files = list(iter_pcap_files(input_dir, output_dir))
     logger.info(
         f"批量处理目录: {input_dir}; 文件数={len(files)}; 输出目录={output_dir}; "
-        f"替换={args.old_ip}->{args.new_ip}; raw={not args.no_raw}; "
-        f"binary_raw={not args.no_binary_raw}"
+        f"替换={args.old_ip}->{args.new_ip}"
     )
     if not files:
         logger.warning("未找到 .pcap/.pcapng 文件")
@@ -127,8 +111,9 @@ def process_directory(args):
     total = PacketStats()
     processed = 0
     for input_file in files:
-        output_file = output_path_for(input_file, input_dir, output_dir, args.suffix)
+        output_file = output_path_for(input_file, input_dir, output_dir)
         try:
+            # 对每个文件执行完整的读取、替换ip、重新写出pcap，并统计结果
             stats = process_pcap_file(input_file, output_file, args)
             merge_stats(total, stats)
             processed += 1
@@ -156,32 +141,18 @@ def process_directory(args):
 def parse_args(argv=None):
     """解析命令行参数。"""
     parser = argparse.ArgumentParser(
-        description="批量重写 PCAP/PCAPNG 中 L2/L3/L4/L7 的 IPv4 字符串/二进制值，并修正 TCP seq/ack/SACK。"
+        description="批量重写 PCAP/PCAPNG 中 L2/L3/L4/应用层 的 IPv4 字符串/二进制值，并修正 TCP seq/ack/SACK。"
     )
     parser.add_argument("input_dir", help="输入目录路径，自动处理其中所有 .pcap/.pcapng 文件")
     parser.add_argument("old_ip", help="待替换的旧 IPv4，例如 1.1.1.1")
     parser.add_argument("new_ip", help="替换后的新 IPv4，例如 192.168.100.200")
     parser.add_argument("-o", "--output-dir", help="输出目录；默认在输入目录下创建 iprewrite_output")
-    parser.add_argument("--suffix", default="_iprewrite", help="输出文件名后缀，默认 _iprewrite")
-    parser.add_argument("--no-recursive", dest="recursive", action="store_false", help="只处理输入目录第一层文件")
-    parser.set_defaults(recursive=True)
-    parser.add_argument("--tcp-max", type=int, default=DEFAULT_TCP_MAX_PAYLOAD, help="单个 TCP segment 最大 payload，默认 1460")
-    parser.add_argument("--udp-max", type=int, default=DEFAULT_UDP_MAX_PAYLOAD, help="UDP payload 最大长度，默认 1472")
-    parser.add_argument("--max-frame-len", type=int, default=DEFAULT_MAX_FRAME_LEN, help="链路层最大帧长，默认 1514")
-    parser.add_argument("--no-raw", action="store_true", help="禁用 ASCII raw payload 兜底替换")
-    parser.add_argument("--no-binary-raw", action="store_true", help="禁用 payload 内 packed IPv4 二进制兜底替换")
     parser.add_argument("--log-file", help="可选日志文件")
     parser.add_argument("--fail-fast", action="store_true", help="单文件失败时立即停止批处理")
     args = parser.parse_args(argv)
 
     validate_ipv4(args.old_ip, "old_ip")
     validate_ipv4(args.new_ip, "new_ip")
-    if args.tcp_max <= 0:
-        parser.error("--tcp-max 必须大于 0")
-    if args.udp_max <= 0:
-        parser.error("--udp-max 必须大于 0")
-    if args.max_frame_len <= 0:
-        parser.error("--max-frame-len 必须大于 0")
     attach_ip_material(args)
     return args
 
