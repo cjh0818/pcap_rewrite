@@ -172,11 +172,11 @@ def is_http_response_line(start_line):
 def parse_chunked_body(data):
     """
     解析 HTTP chunked body。
-    返回 (body_bytes, trailer_block, consumed_len)。
+    返回 (chunks列表, trailer_block, consumed_len)。
     """
     pos = 0
     n = len(data)
-    body_out = bytearray()
+    chunks = []
 
     while True:
         # 读取 chunk-size 行（十六进制）
@@ -203,36 +203,36 @@ def parse_chunked_body(data):
         if chunk_size == 0:
             # 可能是 trailer 或直接结束
             if pos + 2 <= n and data[pos:pos + 2] == b"\r\n":
-                return bytes(body_out), b"", pos + 2
+                return chunks, b"", pos + 2
             trailer_end = data.find(b"\r\n\r\n", pos)
             if trailer_end < 0:
                 raise RewriteError("http.chunked.trailer_incomplete")
             trailer = data[pos:trailer_end]
-            return bytes(body_out), trailer, trailer_end + 4
+            return chunks, trailer, trailer_end + 4
 
         if pos + chunk_size + 2 > n:
             raise RewriteError("http.chunked.data_incomplete")
         chunk_data = data[pos:pos + chunk_size]
         if data[pos + chunk_size:pos + chunk_size + 2] != b"\r\n":
             raise RewriteError("http.chunked.missing_data_crlf")
-        body_out.extend(chunk_data)
+        chunks.append(chunk_data)
         pos += chunk_size + 2
 
 
-def build_chunked_body(body, trailer_block=b""):
+def build_chunked_body(chunks, trailer_block=b""):
     """
-    重新构造 HTTP chunked body（含末尾 0\r\n 和可选 trailer）。
+    重新构造 HTTP chunked body（保留多个 chunk 的结构，重算各自的 chunk-size，含末尾 0\r\n 和可选 trailer）。
     """
-    if body:
-        out = format(len(body), "x").encode("ascii") + b"\r\n" + body + b"\r\n"
-    else:
-        out = b""
-    out += b"0\r\n"
+    out = bytearray()
+    for chunk in chunks:
+        if chunk:
+            out.extend(format(len(chunk), "x").encode("ascii") + b"\r\n" + chunk + b"\r\n")
+    out.extend(b"0\r\n")
     if trailer_block:
-        out += trailer_block + b"\r\n\r\n"
+        out.extend(trailer_block + b"\r\n\r\n")
     else:
-        out += b"\r\n"
-    return out
+        out.extend(b"\r\n")
+    return bytes(out)
 
 
 # =============================================================================
@@ -369,15 +369,34 @@ def replace_one_http1_message(data, start, ctx):
     if is_chunked:
         # chunked + Content-Length 同时存在时，删除 Content-Length（RFC 7230）
         new_headers = remove_header(new_headers, b"Content-Length")
-        body_bytes, trailer_block, consumed_body_len = parse_chunked_body(data[body_start:])
+        chunks, trailer_block, consumed_body_len = parse_chunked_body(data[body_start:])
         original_body_segment = data[body_start:body_start + consumed_body_len]
-        new_body_bytes, body_changed, enc_label = replace_body_with_encoding(
-            body_bytes, content_encoding, old_ip, new_ip,
-        )
+        
+        enc = (content_encoding or b"identity").strip().lower()
+        body_changed = False
+        new_chunks = []
+        
+        if enc in (b"", b"identity"):
+            # identity 编码逐 chunk 替换，保留原有 chunk 边界以准确更新每个 chunk-size
+            for chunk in chunks:
+                new_chunk = chunk.replace(old_ip, new_ip)
+                new_chunks.append(new_chunk)
+                if new_chunk != chunk:
+                    body_changed = True
+            enc_label = "identity"
+        else:
+            # 压缩的 body 需要拼接解压，替换并重压缩后作为单个大 chunk 发送
+            body_bytes = b"".join(chunks)
+            new_body_bytes, body_chunk_changed, enc_label = replace_body_with_encoding(
+                body_bytes, content_encoding, old_ip, new_ip,
+            )
+            body_changed = body_chunk_changed
+            new_chunks = [new_body_bytes] if new_body_bytes else []
+
         new_trailer = trailer_block.replace(old_ip, new_ip)
         trailer_changed = new_trailer != trailer_block
         if body_changed or trailer_changed:
-            new_body = build_chunked_body(new_body_bytes, new_trailer)
+            new_body = build_chunked_body(new_chunks, new_trailer)
             label_suffix = f"chunked.{enc_label}"
         else:
             new_body = original_body_segment
