@@ -10,12 +10,19 @@ from protocols.websocket import WebSocketHandler
 from protocols.tls_sni import TLSClientHelloSNIHandler
 from protocols.http2 import HTTP2RejectHandler
 from protocols.http1 import HTTP1Handler
+from protocols.dns import DNSHandler
+from protocols.mongodb import MongoDBHandler
 from protocols.mysql import MySQLHandler
 from protocols.postgresql import PostgreSQLHandler
 from protocols.redis_resp import RedisRESPHandler
 from protocols.socks5 import SOCKS5Handler
+from protocols.ftp import FTPHandler
+from protocols.smtp import SMTPHandler
+from protocols.telnet import TelnetHandler
+from protocols.rdp import RDPRejectHandler
 from protocols.known_text import KnownUnsupportedTextHandler
 from protocols.tcp_raw import RawTCPHandler
+from protocols.dhcp import DHCPHandler
 from protocols.dtls import DTLSRejectHandler
 from protocols.quic import QUICRejectHandler
 from protocols.udp_raw import RawUDPHandler
@@ -27,15 +34,23 @@ TCP_DISPATCHER = HandlerDispatcher([
     TLSClientHelloSNIHandler(),
     HTTP2RejectHandler(),
     HTTP1Handler(),
+    DNSHandler(),
+    MongoDBHandler(),
     MySQLHandler(),
     PostgreSQLHandler(),
     RedisRESPHandler(),
     SOCKS5Handler(),
+    FTPHandler(),
+    SMTPHandler(),
+    TelnetHandler(),
+    RDPRejectHandler(),
     KnownUnsupportedTextHandler(),
     RawTCPHandler(),
 ])
 
 UDP_DISPATCHER = HandlerDispatcher([
+    DHCPHandler(),
+    DNSHandler(),
     DTLSRejectHandler(),
     QUICRejectHandler(),
     RawUDPHandler(),

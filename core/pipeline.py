@@ -34,8 +34,10 @@ def rewrite_udp_packet(packet, index, args, stats):
     if not (IP in packet and UDP in packet):
         return
     udp = packet[UDP]
+    # 获取UDP的真实payload
     payload = real_udp_payload(packet)
     ctx = RewriteContext(args, packet[IP], udp, "UDP", index, None, None, {})
+    # 使用 UDP_DISPATCHER 选择匹配不同协议 handler
     result = UDP_DISPATCHER.rewrite(payload, ctx)
     if not result.ok:
         stats.failures += 1
@@ -53,6 +55,7 @@ def rewrite_udp_packet(packet, index, args, stats):
 
     if not changed:
         return
+    # 改写后 payload 超过阈值时回滚，避免生成异常大包
     if len(new_payload) > DEFAULT_UDP_MAX_PAYLOAD:
         stats.failures += 1
         logger.error(f"帧#{index} UDP payload 超过阈值 {len(new_payload)}>{DEFAULT_UDP_MAX_PAYLOAD}，已回滚")

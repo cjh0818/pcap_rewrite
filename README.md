@@ -57,10 +57,6 @@ python3 -m main <input_dir> <old_ip> <new_ip>
 # 完整示例
 python3 -m main /data/pcaps 10.0.0.1 192.168.1.100 \
     -o /data/output \
-    --tcp-max 1400 \
-    --udp-max 1400 \
-    --max-frame-len 1514 \
-    --suffix _rewritten
 ```
 
 ### 参数说明
@@ -71,13 +67,6 @@ python3 -m main /data/pcaps 10.0.0.1 192.168.1.100 \
 | `old_ip` | 待替换的旧 IPv4 | 必填 |
 | `new_ip` | 替换后的新 IPv4 | 必填 |
 | `-o`, `--output-dir` | 输出目录 | `input_dir/iprewrite_output` |
-| `--suffix` | 输出文件后缀 | `_pipeline_iprewrite` |
-| `--no-recursive` | 仅处理顶层目录 | 递归 |
-| `--tcp-max` | TCP 单段最大 payload | 1460 |
-| `--udp-max` | UDP 最大 payload | 1472 |
-| `--max-frame-len` | 链路层最大帧长 | 1514 |
-| `--no-raw` | 禁用 ASCII 文本兜底替换 | 启用 |
-| `--no-binary-raw` | 禁用 packed 二进制兜底替换 | 启用 |
 | `--log-file` | 日志文件路径 | 仅控制台 |
 | `--fail-fast` | 单文件失败立即停止 | 继续处理 |
 
