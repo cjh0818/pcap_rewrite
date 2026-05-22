@@ -3,7 +3,7 @@
 DHCP/BOOTP 协议改写。
 
 支持固定 IPv4 字段 ciaddr/yiaddr/siaddr/giaddr，以及 Scapy 已解析为
-IPv4 字符串的 DHCP options。未能结构化定位但含旧 IP 的 DHCP payload 会拒绝。
+IPv4 字符串的 DHCP options。未能结构化定位但含旧 IP 的 DHCP payload 会跳过而非抛异常。
 """
 
 from scapy.layers.dhcp import BOOTP, DHCP
@@ -63,11 +63,11 @@ def replace_option_value(value, ctx):
 
 
 def rewrite_dhcp_payload(payload, ctx):
-    """改写 BOOTP/DHCP payload。"""
+    """改写 BOOTP/DHCP payload。返回 (payload, changed, label)。"""
     if not looks_like_bootp(payload):
         if has_old_material(payload, ctx):
-            raise RewriteError("dhcp.invalid_bootp_with_ip")
-        return payload, False
+            return payload, False, "dhcp.invalid_bootp_skipped"
+        return payload, False, "dhcp.unchanged"
 
     bootp = BOOTP(payload)
     changed = False
@@ -90,13 +90,13 @@ def rewrite_dhcp_payload(payload, ctx):
 
     if not changed:
         if has_old_material(payload, ctx):
-            raise RewriteError("dhcp.old_ip_not_in_supported_field")
-        return payload, False
+            return payload, False, "dhcp.unsupported_field_skipped"
+        return payload, False, "dhcp.unchanged"
 
     new_payload = bytes(bootp)
     if ctx.old_ip_bin != ctx.new_ip_bin and has_old_material(new_payload, ctx):
         raise RewriteError("dhcp.ip_remains_after_replace")
-    return new_payload, True
+    return new_payload, True, "dhcp"
 
 
 class DHCPHandler(ProtocolHandler):
@@ -108,5 +108,5 @@ class DHCPHandler(ProtocolHandler):
         return ctx.proto_name == "UDP" and payload and (is_dhcp_port(ctx) or looks_like_bootp(payload))
 
     def rewrite(self, payload, ctx):
-        new_payload, changed = rewrite_dhcp_payload(payload, ctx)
-        return RewriteResult(True, changed, new_payload, "dhcp" if changed else "dhcp.unchanged")
+        new_payload, changed, label = rewrite_dhcp_payload(payload, ctx)
+        return RewriteResult(True, changed, new_payload, label)

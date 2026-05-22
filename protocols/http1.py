@@ -516,8 +516,17 @@ def rewrite_http1_stream_safe(stream, ctx, args):
         rest = stream[pos:]
         ws_state = ctx.tcp_state()
 
-        # 已建立或正在建立 WebSocket 时，切换到 WebSocket handler
-        if ws_state.get("websocket_established") or ws_state.get("websocket_pending"):
+        # WebSocket 已建立 → 切换到 WebSocket handler
+        if ws_state.get("websocket_established"):
+            new_ws = rewrite_websocket_frames(rest, ctx)
+            output.extend(new_ws)
+            changed = changed or new_ws != rest
+            labels.append("websocket")
+            pos = len(stream)
+            break
+
+        # websocket_pending 但数据仍像 HTTP（反方向的 101 响应），继续走 HTTP 解析
+        if ws_state.get("websocket_pending") and not looks_like_http1(rest):
             new_ws = rewrite_websocket_frames(rest, ctx)
             output.extend(new_ws)
             changed = changed or new_ws != rest

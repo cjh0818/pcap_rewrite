@@ -16,7 +16,7 @@ from scapy.layers.inet import IP, TCP
 from core.context import TcpRewritePlan
 from core.flow import reverse_flow_key
 from core.utils import clear_autofields, map_offset, real_tcp_payload, seq_add, seq_offset, set_l4_payload
-from config import TCP_FLAG_ACK, TCP_FLAG_PSH, TCP_FLAG_FIN, DEFAULT_MAX_FRAME_LEN, DEFAULT_TCP_MAX_PAYLOAD
+from config import TCP_FLAG_ACK, TCP_FLAG_PSH, TCP_FLAG_FIN, TCP_FLAG_SYN, TCP_FLAG_RST, DEFAULT_MAX_FRAME_LEN, DEFAULT_TCP_MAX_PAYLOAD
 
 
 def tcp_payload_capacity(packet):
@@ -35,13 +35,15 @@ def tcp_payload_capacity(packet):
 
 
 def is_pure_ack(packet):
-    """判断 TCP 包是否为无 payload 的纯 ACK（仅 ACK 标志且无数据）。"""
-    return (
-        IP in packet
-        and TCP in packet
-        and int(packet[TCP].flags) == TCP_FLAG_ACK
-        and not real_tcp_payload(packet)
-    )
+    """判断 TCP 包是否为无 payload 的 ACK（至少含 ACK 标志、无 SYN/FIN/RST、无数据）。"""
+    if not (IP in packet and TCP in packet):
+        return False
+    flags = int(packet[TCP].flags)
+    if not (flags & TCP_FLAG_ACK):
+        return False
+    if flags & (TCP_FLAG_SYN | TCP_FLAG_FIN | TCP_FLAG_RST):
+        return False
+    return not real_tcp_payload(packet)
 
 
 def clear_tcp_end_flags(packet):
@@ -110,7 +112,8 @@ def clone_response_ack(packets, packet_keys, start_index, key, base_seq, ack_off
 
     ack_packet = copy.deepcopy(template)
     set_l4_payload(ack_packet[TCP], b"")
-    ack_packet[TCP].flags = TCP_FLAG_ACK
+    # 保留模板包的 PSH（如果存在），确保至少包含 ACK
+    ack_packet[TCP].flags = int(template[TCP].flags) | TCP_FLAG_ACK
     # 设置确认号 = base_seq + 已写入新流的偏移
     ack_packet[TCP].ack = seq_add(base_seq, ack_offset)
     clear_autofields(ack_packet, ack_packet[IP], ack_packet[TCP])

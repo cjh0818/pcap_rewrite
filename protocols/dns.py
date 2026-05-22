@@ -2,8 +2,9 @@
 """
 DNS 协议改写：支持 UDP DNS message 和 TCP DNS length-prefixed message。
 
-当前只改写 A 记录中的 IPv4 rdata。DNS name、TXT、EDNS 等字段含旧 IP 时拒绝，
+当前只改写 A 记录中的 IPv4 rdata。DNS name、TXT、EDNS 等字段含旧 IP 时跳过，
 避免破坏压缩名称、长度前缀或二进制扩展字段。
+畸形 / 不完整消息中含旧 IP 时原样保留并标记 skip，不抛异常回滚整条 TCP stream。
 """
 
 from scapy.layers.dns import DNS
@@ -62,13 +63,14 @@ def iter_dns_rr(section):
 
 def rewrite_dns_message(message, ctx):
     """
-    改写一个 DNS message。
+    改写一个 DNS message。返回 (payload, changed, label)。
     仅支持 A 记录 rdata 的 4 字节 IPv4 地址替换。
+    畸形消息或不支持的记录中含旧 IP 时跳过而非抛异常。
     """
     if not looks_like_dns_message(message):
         if has_old_material(message, ctx):
-            raise RewriteError("dns.invalid_message_with_ip")
-        return message, False
+            return message, False, "dns.invalid_message_skipped"
+        return message, False, "dns.unchanged"
 
     dns = DNS(message)
     changed = False
@@ -83,25 +85,28 @@ def rewrite_dns_message(message, ctx):
 
     if not changed:
         if has_old_material(message, ctx):
-            raise RewriteError("dns.old_ip_not_in_supported_a_record")
-        return message, False
+            return message, False, "dns.unsupported_field_skipped"
+        return message, False, "dns.unchanged"
 
     new_message = bytes(dns)
     if ctx.old_ip_bin != ctx.new_ip_bin and has_old_material(new_message, ctx):
         raise RewriteError("dns.ip_remains_after_replace")
-    return new_message, True
+    return new_message, True, "dns"
 
 
 def rewrite_tcp_dns(payload, ctx):
-    """改写 TCP DNS length-prefixed message 序列。"""
+    """改写 TCP DNS length-prefixed message 序列。返回 (payload, changed, label)。"""
     out = bytearray()
     pos = 0
     changed = False
+    skipped_incomplete_with_ip = False
+    skipped_unsupported_with_ip = False
+
     while pos < len(payload):
         if pos + 2 > len(payload):
             tail = payload[pos:]
             if has_old_material(tail, ctx):
-                raise RewriteError("dns.tcp.trailing_incomplete_with_ip")
+                skipped_incomplete_with_ip = True
             out.extend(tail)
             break
         msg_len = int.from_bytes(payload[pos:pos + 2], "big")
@@ -109,15 +114,33 @@ def rewrite_tcp_dns(payload, ctx):
         if msg_len < 12 or end > len(payload):
             tail = payload[pos:]
             if has_old_material(tail, ctx):
-                raise RewriteError("dns.tcp.incomplete_message_with_ip")
+                skipped_incomplete_with_ip = True
             out.extend(tail)
             break
-        new_msg, msg_changed = rewrite_dns_message(payload[pos + 2:end], ctx)
+        new_msg, msg_changed, msg_label = rewrite_dns_message(payload[pos + 2:end], ctx)
+        if "skipped" in msg_label:
+            if "unsupported" in msg_label:
+                skipped_unsupported_with_ip = True
+            else:
+                skipped_incomplete_with_ip = True
         out.extend(len(new_msg).to_bytes(2, "big"))
         out.extend(new_msg)
         changed = changed or msg_changed or len(new_msg) != msg_len
         pos = end
-    return bytes(out), changed
+
+    if changed:
+        if skipped_unsupported_with_ip or skipped_incomplete_with_ip:
+            label = "dns.tcp+skipped"
+        else:
+            label = "dns.tcp"
+    elif skipped_unsupported_with_ip:
+        label = "dns.tcp.unsupported_skipped"
+    elif skipped_incomplete_with_ip:
+        label = "dns.tcp.incomplete_skipped"
+    else:
+        label = "dns.tcp.unchanged"
+
+    return bytes(out), changed, label
 
 
 class DNSHandler(ProtocolHandler):
@@ -136,7 +159,7 @@ class DNSHandler(ProtocolHandler):
 
     def rewrite(self, payload, ctx):
         if ctx.proto_name == "TCP":
-            new_payload, changed = rewrite_tcp_dns(payload, ctx)
-            return RewriteResult(True, changed, new_payload, "dns.tcp" if changed else "dns.tcp.unchanged")
-        new_payload, changed = rewrite_dns_message(payload, ctx)
-        return RewriteResult(True, changed, new_payload, "dns.udp" if changed else "dns.udp.unchanged")
+            new_payload, changed, label = rewrite_tcp_dns(payload, ctx)
+            return RewriteResult(True, changed, new_payload, label)
+        new_payload, changed, label = rewrite_dns_message(payload, ctx)
+        return RewriteResult(True, changed, new_payload, label)

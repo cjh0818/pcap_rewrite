@@ -101,13 +101,18 @@ def rewrite_websocket_frames(payload, ctx):
         # 如果有 mask 则先解 mask 得到明文
         decoded = apply_ws_mask(raw_frame_payload, mask_key) if masked else raw_frame_payload
 
-        # 仅对 text 帧（且未分片）执行替换
-        if ctx.old_ip in decoded:
-            if opcode != 0x1:
-                raise RewriteError(f"websocket.opcode_{opcode:#x}_with_ip_not_supported")
+        # 控制帧 (Close/Ping/Pong) 含旧 IP 原样保留，不影响同 stream 的 text frame
+        if opcode in {0x8, 0x9, 0xA}:
+            new_decoded = decoded
+        elif ctx.old_ip in decoded:
             if not fin:
                 raise RewriteError("websocket.fragmented_text_with_ip_not_supported")
-            new_decoded = decoded.replace(ctx.old_ip, ctx.new_ip)
+            if opcode == 0x1:
+                new_decoded = decoded.replace(ctx.old_ip, ctx.new_ip)
+            elif opcode == 0x2:
+                raise RewriteError("websocket.binary_with_ip_not_supported")
+            else:
+                raise RewriteError(f"websocket.opcode_{opcode:#x}_with_ip_not_supported")
         else:
             new_decoded = decoded
 
@@ -116,7 +121,7 @@ def rewrite_websocket_frames(payload, ctx):
         out.append(b1)
         len_bytes = encode_ws_length(len(new_decoded))
         if masked:
-            out.append(len_bytes[0] | 0x80)  # 长度首字节补 mask bit
+            out.append(len_bytes[0] | 0x80)
             out.extend(len_bytes[1:])
             out.extend(mask_key)
         else:

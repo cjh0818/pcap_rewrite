@@ -1,7 +1,15 @@
 # -*- coding: utf-8 -*-
 """
 MySQL 协议改写：仅替换 COM_QUERY(0x03) 命令的 SQL 文本中的 IPv4。
-逐 packet 解析并更新 payload 长度字段。
+
+安全边界：
+- classic uncompressed MySQL protocol
+- no TLS
+- no compression
+- no CLIENT_QUERY_ATTRIBUTES
+- 仅在已拿到完整 MySQL packet 时解析/改写
+- 非 COM_QUERY 或无法完整解析的 payload 中即使含旧 IP，也只明确跳过该 MySQL packet，
+  不抛错回滚整条 TCP stream 中已经完成的 COM_QUERY 改写。
 """
 
 from core.context import RewriteError, RewriteResult, is_port
@@ -54,31 +62,39 @@ class MySQLHandler(ProtocolHandler):
 
     def rewrite(self, payload, ctx):
         """
-        逐 packet 解析：
-        - COM_QUERY(0x03): 替换 SQL 文本中的 IP，重新构造 packet
-        - 其他命令：含旧 IP 则拒绝，不含则原样保留
+        解析 MySQL packet stream：
+        - COM_QUERY(0x03): 替换 SQL 文本中的 IP，重新构造 packet 并更新 3 字节长度
+        - 其他命令：不安全解析；即使含旧 IP，也原样保留并继续处理后续 packet
+        - 不完整 packet：原样保留，不做盲替换
         """
+        old_ip = ctx.old_ip
+        new_ip = ctx.new_ip
+
         out = bytearray()
         pos = 0
         changed = False
+        skipped_unsupported_with_ip = False
+        skipped_incomplete_with_ip = False
         n = len(payload)
 
         while pos < n:
-            # 至少需要 4 字节 packet header
+            # 至少需要 4 字节 packet header；不足则不能安全解析，原样保留。
             if pos + 4 > n:
                 tail = payload[pos:]
-                if ctx.old_ip in tail:
-                    raise RewriteError("mysql.trailing_incomplete_packet_with_ip")
+                if old_ip in tail:
+                    skipped_incomplete_with_ip = True
                 out.extend(tail)
                 break
 
             packet_len = parse_mysql_payload_len(payload[pos:pos + 3])
             seq_id = payload[pos + 3]
             end = pos + 4 + packet_len
+
+            # packet_len==0 不一定值得强行改写；保持保守，原样保留。
             if packet_len == 0 or end > n:
                 tail = payload[pos:]
-                if ctx.old_ip in tail:
-                    raise RewriteError("mysql.incomplete_packet_with_ip")
+                if old_ip in tail:
+                    skipped_incomplete_with_ip = True
                 out.extend(tail)
                 break
 
@@ -90,19 +106,32 @@ class MySQLHandler(ProtocolHandler):
 
             cmd = packet_payload[0]
             if cmd == MYSQL_CMD_QUERY:
-                # COM_QUERY: 命令字节后的部分是 SQL 文本
+                # 当前测试范围：无 CLIENT_QUERY_ATTRIBUTES，命令字节后的部分就是 SQL 文本。
                 sql = packet_payload[1:]
-                new_sql = sql.replace(ctx.old_ip, ctx.new_ip)
+                new_sql = sql.replace(old_ip, new_ip)
                 new_packet_payload = bytes([cmd]) + new_sql
                 if new_packet_payload != packet_payload:
                     changed = True
                 out.extend(build_mysql_packet(seq_id, new_packet_payload))
             else:
-                # 非 COM_QUERY 命令含旧 IP 时拒绝（二进制协议不安全）
-                if ctx.old_ip in packet_payload:
-                    raise RewriteError(f"mysql.command_{cmd:#04x}_with_ip_not_supported")
+                # 非 COM_QUERY 属于不支持的命令类型。不要盲改，也不要抛错回滚整条流。
+                if old_ip in packet_payload:
+                    skipped_unsupported_with_ip = True
                 out.extend(payload[pos:end])
+
             pos = end
 
-        label = "mysql.query" if changed else "mysql.unchanged"
+        if changed and skipped_unsupported_with_ip:
+            label = "mysql.query.unsupported_ip_skipped"
+        elif changed and skipped_incomplete_with_ip:
+            label = "mysql.query.incomplete_ip_skipped"
+        elif changed:
+            label = "mysql.query"
+        elif skipped_unsupported_with_ip:
+            label = "mysql.unsupported_ip_skipped"
+        elif skipped_incomplete_with_ip:
+            label = "mysql.incomplete_ip_skipped"
+        else:
+            label = "mysql.unchanged"
+
         return RewriteResult(True, changed, bytes(out), label)

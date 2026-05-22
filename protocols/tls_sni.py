@@ -56,8 +56,9 @@ def replace_in_tls(payload, old_ip, new_ip):
         record_end = pos + 5 + record_len
         body = bytes(payload[pos + 5:record_end])
 
-        if old_ip not in body:
-            # body 不含旧 IP，原样保留整个 record
+        if record_type != 0x16:
+            # 非 Handshake record（如 ApplicationData/CCS/Alert），即使 payload
+            # 中巧合出现 old_ip 字节串也不应改写，原样保留整个 record。
             output.append(record_type)
             output.extend(version)
             output.extend(record_len.to_bytes(2, "big"))
@@ -65,9 +66,14 @@ def replace_in_tls(payload, old_ip, new_ip):
             pos = record_end
             continue
 
-        # 非 Handshake record 中出现 IP 是异常情况，拒绝
-        if record_type != 0x16:
-            raise RewriteError(f"tls.record_type_{record_type:#04x}_with_ip")
+        if old_ip not in body:
+            # Handshake record 不含旧 IP，无需处理
+            output.append(record_type)
+            output.extend(version)
+            output.extend(record_len.to_bytes(2, "big"))
+            output.extend(body)
+            pos = record_end
+            continue
 
         new_body = replace_in_handshake_records(body, old_ip, new_ip)
         if len(new_body) >= (1 << 16):
@@ -80,17 +86,13 @@ def replace_in_tls(payload, old_ip, new_ip):
         output.extend(new_body)
         pos = record_end
 
-    new_payload = bytes(output)
-    # 安全检查：确保旧 IP 已被完全替换
-    if old_ip not in new_ip and old_ip in new_payload:
-        raise RewriteError("tls.ip_remains_after_replace")
-    return new_payload
+    return bytes(output)
 
 
 def replace_in_handshake_records(body, old_ip, new_ip):
     """
-    遍历 TLS Handshake 消息序列，改写 ClientHello(msg_type=0x01)。
-    非 ClientHello 消息含 IP 时拒绝。
+    遍历 TLS Handshake 消息序列，仅改写 ClientHello(msg_type=0x01) 中的 SNI。
+    ServerHello/Certificate 等非 ClientHello 消息即使巧合含 IP 也跳过。
     """
     output = bytearray()
     pos = 0
@@ -99,12 +101,18 @@ def replace_in_handshake_records(body, old_ip, new_ip):
         if pos + 4 > n:
             raise RewriteError("tls.handshake.incomplete_header")
         msg_type = body[pos]
-        # Handshake 消息长度为 3 字节大端
         msg_len = int.from_bytes(body[pos + 1:pos + 4], "big")
         msg_end = pos + 4 + msg_len
         if msg_end > n:
             raise RewriteError("tls.handshake.msg_truncated")
         msg_body = body[pos + 4:msg_end]
+
+        if msg_type != 0x01:
+            output.append(msg_type)
+            output.extend(msg_len.to_bytes(3, "big"))
+            output.extend(msg_body)
+            pos = msg_end
+            continue
 
         if old_ip not in msg_body:
             output.append(msg_type)
@@ -112,9 +120,6 @@ def replace_in_handshake_records(body, old_ip, new_ip):
             output.extend(msg_body)
             pos = msg_end
             continue
-
-        if msg_type != 0x01:  # 只允许 ClientHello
-            raise RewriteError(f"tls.handshake.msg_type_{msg_type:#04x}_with_ip")
 
         new_msg_body = replace_in_client_hello(msg_body, old_ip, new_ip)
         if len(new_msg_body) >= (1 << 24):
@@ -208,13 +213,15 @@ def replace_in_extensions(block, old_ip, new_ip):
             raise RewriteError("tls.extensions.data_overflow")
         ext_data = block[pos + 4:ext_end]
 
-        if old_ip not in ext_data:
+        if ext_type != 0x0000:
             output.extend(block[pos:ext_end])
             pos = ext_end
             continue
 
-        if ext_type != 0x0000:  # 只允许 SNI
-            raise RewriteError(f"tls.extensions.ext_type_{ext_type:#06x}_with_ip")
+        if old_ip not in ext_data:
+            output.extend(block[pos:ext_end])
+            pos = ext_end
+            continue
 
         new_ext_data = replace_in_sni_extension(ext_data, old_ip, new_ip)
         if len(new_ext_data) >= (1 << 16):
@@ -255,15 +262,13 @@ def replace_in_server_name_list(block, old_ip, new_ip):
         if pos + 3 > n:
             raise RewriteError("tls.sni.incomplete_server_name")
         name_type = block[pos]
-        if name_type != 0x00:
-            raise RewriteError(f"tls.sni.name_type_{name_type:#04x}")
         name_len = int.from_bytes(block[pos + 1:pos + 3], "big")
         name_end = pos + 3 + name_len
         if name_end > n:
             raise RewriteError("tls.sni.name_overflow")
         name_data = block[pos + 3:name_end]
 
-        if old_ip not in name_data:
+        if name_type != 0x00 or old_ip not in name_data:
             output.extend(block[pos:name_end])
             pos = name_end
             continue
