@@ -146,6 +146,10 @@ class TcpFlowState:
     conflicts: int = 0
     holes: int = 0
     packet_new_seq: dict = field(default_factory=dict, init=False)
+    # 标记是否需要保留原始 TCP segment 边界（由 handler.requires_stream_merge 取反得到）
+    preserve_boundaries: bool = False
+    # per-segment 模式下每个包改写后的新 payload（key=包索引）
+    segment_payloads: dict = field(default_factory=dict, init=False)
 
     @property
     def old_len(self):

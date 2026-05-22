@@ -20,9 +20,19 @@ class ProtocolHandler(ABC):
         - detect 只回答"当前 payload 是否属于我"，不修改数据包。
         - rewrite 只处理当前协议的结构和长度字段，不关心 TCP 重分段。
         - handler 之间不能互相调用，避免 HTTP/TLS/DB 协议逻辑耦合。
+
+    流级合并控制:
+        - requires_stream_merge=False（默认）：保留原始 TCP segment 边界，
+          使用 map_offset 按 edits 映射每个 segment 的 new_stream 份额。
+          适用于 FTP/SMTP/Telnet/MySQL/Pg/Redis/DNS/SOCKS5/WebSocket 等
+          request-response 或交互式协议。
+        - requires_stream_merge=True：将 new_stream 按 MTU 重新切包，
+          不保留原始 segment 边界。适用于 HTTP body、MongoDB BSON 等可能
+          跨多个 TCP segment 的协议，或 RawTCP 无结构兜底。
     """
 
     name = "base"
+    requires_stream_merge: bool = False
 
     @abstractmethod
     def detect(self, payload, ctx):
@@ -74,6 +84,13 @@ class HandlerDispatcher:
         if handler is None:
             return RewriteResult(True, False, payload, "none")
         return self._rewrite_with_handler(handler, payload, ctx)
+
+    def select_handler(self, payload, ctx):
+        """
+        仅执行 detect 阶段，返回命中的 handler 或 None。
+        供上层在调用 rewrite 之前判断 handler 的元属性（如 requires_stream_merge）。
+        """
+        return self._select_handler(payload, ctx)
 
     def _select_handler(self, payload, ctx):
         """
