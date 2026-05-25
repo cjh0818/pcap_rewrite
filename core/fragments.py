@@ -127,6 +127,7 @@ class FragmentManager:
 
     def __init__(self):
         self._records = {}
+        self._completed_fragments = {}
 
     def reassemble(self, packets):
         """
@@ -146,6 +147,11 @@ class FragmentManager:
                 continue
 
             key = self._fragment_group_key(packet)
+            if self._is_completed_duplicate(key, info):
+                # 重组完成后仍可能在抓包里看到同一 IP datagram 的重传分片。
+                # 这些分片已由虚拟包统一改写并回切，原样输出会造成漏改。
+                packets[index] = None
+                continue
             if key in blocked_keys:
                 continue
             group = active.get(key)
@@ -177,6 +183,10 @@ class FragmentManager:
 
             original_slots = sorted(group.fragments, key=lambda fragment: fragment.index)
             original_by_offset = group.unique_fragments()
+            self._completed_fragments[key] = {
+                fragment.offset: (fragment.payload, fragment.mf)
+                for fragment in original_by_offset
+            }
             self._records[marker] = FragmentRecord(
                 proto=key[2],
                 original_sizes=[len(fragment.payload) for fragment in original_by_offset],
@@ -272,6 +282,16 @@ class FragmentManager:
     @staticmethod
     def is_reassembled_fragment(packet):
         return bool(getattr(packet, "_is_fragment_reassembly", False))
+
+    def _is_completed_duplicate(self, key, info):
+        completed = self._completed_fragments.get(key)
+        if not completed:
+            return False
+        expected = completed.get(info.offset)
+        if expected is None:
+            return False
+        payload, mf = expected
+        return payload == info.payload and mf == info.mf
 
     @staticmethod
     def _clear_marker(packet):

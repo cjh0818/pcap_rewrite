@@ -12,7 +12,8 @@ SOCKS5 协议改写：替换请求中的 IPv4 地址（ATYP=0x01）和域名（A
 from core.context import RewriteError, RewriteResult, is_port
 from core.dispatcher import ProtocolHandler
 from core.utils import contains_ip_text_boundary, replace_ip_text_boundary
-from config import SOCKS_PORT
+from config import HTTP_REQUEST_RE, HTTP_RESPONSE_RE, SOCKS_PORT
+from protocols.http1 import rewrite_http1_stream_safe
 
 
 class SOCKS5Handler(ProtocolHandler):
@@ -46,8 +47,7 @@ class SOCKS5Handler(ProtocolHandler):
         while pos < len(buf):
             if buf[pos] != 0x05:
                 tail = bytes(buf[pos:])
-                from protocols import TCP_DISPATCHER
-                result = TCP_DISPATCHER.rewrite(tail, ctx, exclude={SOCKS5Handler})
+                result = self._rewrite_tunnel_tail(tail, ctx)
                 if not result.ok:
                     return RewriteResult(False, False, payload, f"socks5.tail.{result.label}", result.reason)
                 buf[pos:] = result.payload
@@ -78,6 +78,19 @@ class SOCKS5Handler(ProtocolHandler):
             break
 
         return RewriteResult(True, changed, bytes(buf), self._label(labels))
+
+    def _rewrite_tunnel_tail(self, tail, ctx):
+        """SOCKS 握手后的 HTTP/WebSocket 流量必须走 HTTP 流级安全入口。"""
+        ws_state = ctx.tcp_state()
+        if (
+            HTTP_REQUEST_RE.match(tail)
+            or HTTP_RESPONSE_RE.match(tail)
+            or ws_state.get("websocket_pending")
+            or ws_state.get("websocket_established")
+        ):
+            return rewrite_http1_stream_safe(tail, ctx, ctx.args)
+        from protocols import TCP_DISPATCHER
+        return TCP_DISPATCHER.rewrite(tail, ctx, exclude={SOCKS5Handler})
 
     def _rewrite_request_message(self, buf, pos, ctx):
         """改写单个 Request/Reply 消息；不是该消息时返回 None。"""

@@ -11,8 +11,10 @@ TCP 流标识生成、按 SYN 分代、流收集与字节流重组。
 from collections import defaultdict
 from scapy.layers.inet import IP, TCP
 from core.context import SegmentMeta, TcpFlowState
-from core.utils import real_tcp_payload, seq_offset
+from core.utils import real_tcp_payload, seq_add, seq_offset
 from config import TCP_FLAG_SYN, TCP_FLAG_ACK, TCP_FLAG_FIN, TCP_FLAG_RST, TCP_SEQ_HALF, TCP_SEQ_MOD
+
+_TCP_REUSE_SEQ_GAP = TCP_SEQ_HALF // 2
 
 
 def endpoint_pair(ip_layer, tcp_layer):
@@ -32,8 +34,9 @@ def assign_tcp_generations(packets):
     """
     generations = {}
     packet_generations = {}
-    ended_pairs = set()
-    last_seq_by_direction = {}
+    reset_pairs = set()
+    ended_directions = set()
+    last_seq_end_by_direction = {}
     for index, packet in enumerate(packets):
         if packet is None or not (IP in packet and TCP in packet):
             continue
@@ -52,22 +55,34 @@ def assign_tcp_generations(packets):
         # SYN 且无 ACK = 新连接发起（三次握手第一步）
         if syn and not ack:
             generations[pair] = generations.get(pair, 0) + 1
-            ended_pairs.discard(pair)
-        elif payload and pair in ended_pairs:
-            # mid-stream 抓包看不到新 SYN 时，FIN/RST 后的新数据视为下一代连接。
+            reset_pairs.discard(pair)
+            ended_directions = {
+                ended for ended in ended_directions
+                if ended[0] != pair
+            }
+        elif payload and (pair in reset_pairs or direction in ended_directions):
+            # FIN 是半关闭，只结束当前方向；RST 才结束整个四元组。
+            # mid-stream 抓包看不到新 SYN 时，结束后同方向新数据视为下一代连接。
             generations[pair] = generations.get(pair, 0) + 1
-            ended_pairs.discard(pair)
-        elif payload and direction in last_seq_by_direction:
-            seq_jump = (int(packet[TCP].seq) - last_seq_by_direction[direction]) % TCP_SEQ_MOD
-            if seq_jump >= TCP_SEQ_HALF:
+            reset_pairs.discard(pair)
+            ended_directions = {
+                ended for ended in ended_directions
+                if ended[0] != pair
+            }
+        elif payload and direction in last_seq_end_by_direction:
+            # 只把巨大正向跳变作为复用启发式；乱序/重传造成的回退不应拆代。
+            forward_gap = (int(packet[TCP].seq) - last_seq_end_by_direction[direction]) % TCP_SEQ_MOD
+            if 0 < forward_gap < TCP_SEQ_HALF and forward_gap >= _TCP_REUSE_SEQ_GAP:
                 generations[pair] = generations.get(pair, 0) + 1
         elif pair not in generations:
             generations[pair] = 0
         packet_generations[index] = generations.get(pair, 0)
         if payload:
-            last_seq_by_direction[direction] = int(packet[TCP].seq)
-        if flags & (TCP_FLAG_FIN | TCP_FLAG_RST):
-            ended_pairs.add(pair)
+            last_seq_end_by_direction[direction] = seq_add(int(packet[TCP].seq), len(payload))
+        if flags & TCP_FLAG_RST:
+            reset_pairs.add(pair)
+        elif flags & TCP_FLAG_FIN:
+            ended_directions.add(direction)
     return packet_generations
 
 
