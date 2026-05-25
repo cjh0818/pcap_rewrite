@@ -2,9 +2,9 @@
 """
 DNS 协议改写：支持 UDP DNS message 和 TCP DNS length-prefixed message。
 
-当前只改写 A 记录中的 IPv4 rdata。DNS name、TXT、EDNS 等字段含旧 IP 时跳过，
-避免破坏压缩名称、长度前缀或二进制扩展字段。
-畸形 / 不完整消息中含旧 IP 时原样保留并标记 skip，不抛异常回滚整条 TCP stream。
+当前只改写 A 记录中的 IPv4 rdata。DNS name、TXT、EDNS 等字段含旧 IP 时拒绝，
+避免 handler 命中后静默漏改或破坏压缩名称、长度前缀、二进制扩展字段。
+畸形 / 不完整消息中含旧 IP 时同样拒绝。
 """
 
 from scapy.layers.dns import DNS
@@ -69,7 +69,7 @@ def rewrite_dns_message(message, ctx):
     """
     if not looks_like_dns_message(message):
         if has_old_material(message, ctx):
-            return message, False, "dns.invalid_message_skipped"
+            raise RewriteError("dns.invalid_message_with_ip")
         return message, False, "dns.unchanged"
 
     dns = DNS(message)
@@ -85,7 +85,7 @@ def rewrite_dns_message(message, ctx):
 
     if not changed:
         if has_old_material(message, ctx):
-            return message, False, "dns.unsupported_field_skipped"
+            raise RewriteError("dns.unsupported_field_with_ip")
         return message, False, "dns.unchanged"
 
     new_message = bytes(dns)
@@ -106,7 +106,7 @@ def rewrite_tcp_dns(payload, ctx):
         if pos + 2 > len(payload):
             tail = payload[pos:]
             if has_old_material(tail, ctx):
-                skipped_incomplete_with_ip = True
+                raise RewriteError("dns.tcp.trailing_incomplete_with_ip")
             out.extend(tail)
             break
         msg_len = int.from_bytes(payload[pos:pos + 2], "big")
@@ -114,7 +114,7 @@ def rewrite_tcp_dns(payload, ctx):
         if msg_len < 12 or end > len(payload):
             tail = payload[pos:]
             if has_old_material(tail, ctx):
-                skipped_incomplete_with_ip = True
+                raise RewriteError("dns.tcp.incomplete_message_with_ip")
             out.extend(tail)
             break
         new_msg, msg_changed, msg_label = rewrite_dns_message(payload[pos + 2:end], ctx)

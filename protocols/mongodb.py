@@ -9,7 +9,7 @@ MongoDB Wire Protocol 改写。
 
 from core.context import RewriteError, RewriteResult
 from core.dispatcher import ProtocolHandler
-from core.utils import has_old_material
+from core.utils import contains_ip_text_boundary, has_old_material, replace_ip_text_boundary
 from config import (
     MONGODB_PORTS,
     MONGO_OPCODES,
@@ -85,10 +85,10 @@ def read_cstring(data, pos, limit, label):
 def replace_cstring(data, pos, limit, ctx, label):
     """读取并替换 cstring 中的旧 IP 文本。"""
     value, new_pos = read_cstring(data, pos, limit, label)
-    new_value = value.replace(ctx.old_ip, ctx.new_ip)
+    new_value, changed = replace_ip_text_boundary(value, ctx.old_ip, ctx.new_ip)
     if b"\x00" in new_value:
         raise RewriteError(f"mongodb.{label}.cstring_null_after_replace")
-    return new_value + b"\x00", new_pos, new_value != value
+    return new_value + b"\x00", new_pos, changed
 
 
 def rewrite_bson_string(data, pos, limit, ctx, label):
@@ -102,9 +102,9 @@ def rewrite_bson_string(data, pos, limit, ctx, label):
     if data[end - 1:end] != b"\x00":
         raise RewriteError(f"mongodb.bson.{label}.string_missing_null")
     value = data[pos + 4:end - 1]
-    new_value = value.replace(ctx.old_ip, ctx.new_ip)
+    new_value, changed = replace_ip_text_boundary(value, ctx.old_ip, ctx.new_ip)
     rewritten = put_int32_le(len(new_value) + 1) + new_value + b"\x00"
-    return rewritten, end, new_value != value
+    return rewritten, end, changed
 
 
 def rewrite_bson_document(data, pos, ctx, depth=0):
@@ -158,7 +158,7 @@ def rewrite_bson_value(element_type, data, pos, limit, ctx, depth):
         if blob_len == 4 and blob == ctx.old_ip_bin:
             rewritten = put_int32_le(4) + subtype + ctx.new_ip_bin
             return rewritten, blob_end, True
-        if ctx.old_ip in blob or ctx.old_ip_bin in blob:
+        if contains_ip_text_boundary(blob, ctx.old_ip) or ctx.old_ip_bin in blob:
             raise RewriteError("mongodb.bson.binary_with_ip_not_supported")
         return data[pos:blob_end], blob_end, False
 
@@ -252,10 +252,10 @@ def rewrite_op_msg(body, ctx):
             pos = section_end
             continue
 
-        rest = body[pos - 1:]
-        if has_old_material(rest, ctx):
+        rest_with_kind = body[pos - 1:]
+        if has_old_material(rest_with_kind, ctx):
             raise RewriteError(f"mongodb.op_msg.section_{section_kind:#x}_with_ip_not_supported")
-        out.extend(rest)
+        out.extend(body[pos:])
         break
 
     return bytes(out), changed
@@ -396,7 +396,7 @@ def rewrite_mongo_message(message, ctx):
 
     new_body, changed = rewrite_mongo_body(opcode, message[16:], ctx)
     new_message = put_int32_le(16 + len(new_body)) + message[4:16] + new_body
-    if ctx.old_ip not in ctx.new_ip and ctx.old_ip in new_message:
+    if not contains_ip_text_boundary(ctx.new_ip, ctx.old_ip) and contains_ip_text_boundary(new_message, ctx.old_ip):
         raise RewriteError("mongodb.ip_remains_after_replace")
     return new_message, changed or len(new_message) != len(message)
 
@@ -432,6 +432,7 @@ class MongoDBHandler(ProtocolHandler):
     """MongoDB Wire Protocol 改写处理器。"""
 
     name = "mongodb"
+    requires_stream_merge = True
 
     def detect(self, payload, ctx):
         if ctx.proto_name != "TCP" or not payload:

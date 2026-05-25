@@ -7,6 +7,7 @@
 
 from core.context import RewriteResult
 from core.dispatcher import ProtocolHandler
+from core.utils import contains_ip_text_boundary
 from config import SSH_BANNER_RE, FTP_GREETING_RE, SMTP_GREETING_RE, POP3_GREETING_RE, IMAP_GREETING_RE
 
 
@@ -39,6 +40,6 @@ class KnownUnsupportedTextHandler(ProtocolHandler):
             if regex.match(payload):
                 label = name
                 break
-        if ctx.old_ip in payload:
+        if contains_ip_text_boundary(payload, ctx.old_ip):
             return RewriteResult(False, False, payload, f"{label}.not_supported", f"{label}.with_ip")
         return RewriteResult(True, False, payload, f"{label}.unchanged")

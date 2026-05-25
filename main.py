@@ -20,8 +20,9 @@ except ImportError as exc:
     raise SystemExit("缺少依赖 scapy，请先执行: pip install scapy") from exc
 from stats import PacketStats, merge_stats
 from core.context import RewriteError
+from core.fragments import FragmentManager
 from core.pipeline import rewrite_l2_l3_udp_pass, rewrite_tcp_pass, build_output_packets
-from core.utils import validate_ipv4, attach_ip_material
+from core.utils import validate_ipv4, attach_ip_material, sync_packet_wirelen
 
 
 def output_path_for(input_file, input_dir, output_dir):
@@ -62,12 +63,20 @@ def process_pcap_file(input_file, output_file, args):
     with PcapReader(str(input_file)) as reader:
         packets = list(reader)
     stats = PacketStats()
-    # 非 TCP 协议的包级改写
+
+    # IP 分片重组：将完整 UDP/TCP 分片组聚合为等价非分片包
+    frag_manager = FragmentManager()
+    frag_manager.reassemble(packets)
+    # 非 TCP 协议的包级改写（分片续片槽位由 FragmentManager 兜底跳过）
     rewrite_l2_l3_udp_pass(packets, args, stats)
     # TCP 流重组 → 协议改写 → 重分段 → SEQ/ACK 修正
     plan = rewrite_tcp_pass(packets, args, stats)
-    # 生成最终输出
+    # 生成最终输出（展开虚拟包为原始分片）
     output_packets = build_output_packets(packets, plan, stats)
+    frag_manager.refragment(output_packets)
+    stats.total_out = len(output_packets)
+    for packet in output_packets:
+        sync_packet_wirelen(packet)
     output_file.parent.mkdir(parents=True, exist_ok=True)
     writer = PcapWriter(str(output_file), append=False, sync=True)
     try:

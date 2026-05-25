@@ -45,9 +45,62 @@ def attach_ip_material(args):
 # 协议 payload 通用检测
 # =============================================================================
 
+IP_TEXT_BOUNDARY_BYTES = b"0123456789."
+IP_COMMA_BOUNDARY_BYTES = b"0123456789,"
+PRINTABLE_TEXT_BYTES = set(b"\t\r\n" + bytes(range(0x20, 0x7F)))
+
+
+def contains_ip_text_boundary(payload, old_ip, boundary_bytes=IP_TEXT_BOUNDARY_BYTES):
+    """
+    判断 payload 中是否存在带文本边界的 IPv4 字符串。
+    只要求左右字符不是数字或分隔符，避免把 10.0.0.1 匹配进 10.0.0.10。
+    """
+    if not old_ip:
+        return False
+    pos = payload.find(old_ip)
+    old_len = len(old_ip)
+    while pos >= 0:
+        left_ok = pos == 0 or payload[pos - 1] not in boundary_bytes
+        right = pos + old_len
+        right_ok = right == len(payload) or payload[right] not in boundary_bytes
+        if left_ok and right_ok:
+            return True
+        pos = payload.find(old_ip, pos + 1)
+    return False
+
+
+def replace_ip_text_boundary(payload, old_ip, new_ip, boundary_bytes=IP_TEXT_BOUNDARY_BYTES):
+    """
+    执行带边界的 IPv4 文本替换。
+    :return: (新payload, 是否发生变化)
+    """
+    if not old_ip:
+        return payload, False
+    out = bytearray()
+    pos = 0
+    changed = False
+    old_len = len(old_ip)
+    while True:
+        match = payload.find(old_ip, pos)
+        if match < 0:
+            out.extend(payload[pos:])
+            break
+        left_ok = match == 0 or payload[match - 1] not in boundary_bytes
+        right = match + old_len
+        right_ok = right == len(payload) or payload[right] not in boundary_bytes
+        if left_ok and right_ok:
+            out.extend(payload[pos:match])
+            out.extend(new_ip)
+            changed = True
+        else:
+            out.extend(payload[pos:right])
+        pos = right
+    return bytes(out), changed
+
+
 def has_old_material(payload, ctx):
-    """判断 payload 中是否仍含旧 IP 文本（供各协议 handler 复用）。"""
-    return ctx.old_ip in payload
+    """判断 payload 中是否仍含带边界的旧 IP 文本（供各协议 handler 复用）。"""
+    return contains_ip_text_boundary(payload, ctx.old_ip)
 
 
 # =============================================================================
@@ -113,6 +166,19 @@ def clear_autofields(packet, ip_layer=None, l4_layer=None):
         packet.wirelen = None
     except (AttributeError, TypeError):
         logger.debug("当前 Packet 不支持重置 wirelen，已跳过")
+
+
+def sync_packet_wirelen(packet):
+    """
+    将 Scapy Packet 的 wirelen 同步为当前实际序列化长度。
+    PcapWriter 会优先使用 packet.wirelen 写 pcap record header 的 orig_len；
+    packet 来自旧抓包模板 copy() 时该字段可能残留旧长度。
+    """
+    try:
+        packet.wirelen = len(bytes(packet))
+    except (AttributeError, TypeError, ValueError):
+        logger.debug("当前 Packet 不支持同步 wirelen，已跳过")
+    return packet
 
 
 # =============================================================================
@@ -187,9 +253,61 @@ def replace_binary_ipv4(payload, args):
     :param args: 命令行参数对象
     :return: (新payload, 是否发生了变化)
     """
-    if args.old_ip_bin not in payload:
+    old_bin = args.old_ip_bin
+    if old_bin not in payload:
         return payload, False
-    return payload.replace(args.old_ip_bin, args.new_ip_bin), True
+    # 预判：old_ip_bin 是否为全同字节（如 \x00*4、\xFF*4），
+    # 此类 pattern 在二进制协议中极常见于填充 / 对齐，需额外做 run-length 检测。
+    all_same_byte = len(set(old_bin)) == 1
+    out = bytearray()
+    pos = 0
+    changed = False
+    old_len = len(old_bin)
+    while True:
+        match = payload.find(old_bin, pos)
+        if match < 0:
+            out.extend(payload[pos:])
+            break
+        out.extend(payload[pos:match])
+        end = match + old_len
+        if is_likely_text_context(payload, match, end):
+            # 可打印文本上下文 → 跳过
+            out.extend(payload[match:end])
+        elif all_same_byte and is_byte_run_extension(payload, match, end):
+            # 全同字节且处于更长 run 中 → 填充 / magic pattern，跳过
+            out.extend(payload[match:end])
+        else:
+            out.extend(args.new_ip_bin)
+            changed = True
+        pos = end
+    return bytes(out), changed
+
+
+def is_likely_text_context(payload, start, end, window=8):
+    """
+    判断 packed IPv4 命中点是否落在可打印文本上下文中。
+    raw binary 兜底只替换非文本上下文，避免把四个空格、四个点等文本误当二进制 IP。
+    """
+    lo = max(0, start - window)
+    hi = min(len(payload), end + window)
+    context = payload[lo:hi]
+    return bool(context) and all(byte in PRINTABLE_TEXT_BYTES for byte in context)
+
+
+def is_byte_run_extension(payload, start, end):
+    """
+    判断 packed IPv4 命中点是否落在更长的同字节连续序列中。
+    仅当 old_ip_bin 四字节全相同时才可能触发（如 \\x00*4、\\xFF*4）。
+    匹配点前后若有同字节延伸，说明是对齐填充 / magic pattern 而非 IP 地址。
+    """
+    byte_val = payload[start]
+    # 检查匹配点之前是否延伸
+    if start > 0 and payload[start - 1] == byte_val:
+        return True
+    # 检查匹配点之后是否延伸
+    if end < len(payload) and payload[end] == byte_val:
+        return True
+    return False
 
 
 def general_replace_payload(payload, args):
@@ -202,8 +320,10 @@ def general_replace_payload(payload, args):
     labels = []
     new_payload = payload
     # 先尝试 ASCII 文本替换（如 b"10.0.0.1"）
-    if args.old_ip_bytes in new_payload:
-        new_payload = new_payload.replace(args.old_ip_bytes, args.new_ip_bytes)
+    new_payload, ascii_changed = replace_ip_text_boundary(
+        new_payload, args.old_ip_bytes, args.new_ip_bytes,
+    )
+    if ascii_changed:
         labels.append("ascii")
     # 再尝试 packed 二进制替换（4 字节大端 IP）
     binary_payload, bin_changed = replace_binary_ipv4(new_payload, args)

@@ -5,11 +5,12 @@ HTTP/1.x 协议改写：支持 Content-Length、chunked、gzip/deflate 编码的
 """
 
 import gzip
+import io
 import zlib
 
 from core.context import RewriteError, RewriteResult
 from core.dispatcher import ProtocolHandler
-from core.utils import general_replace_payload
+from core.utils import contains_ip_text_boundary, general_replace_payload, replace_ip_text_boundary
 from config import (
     HTTP_HEADER_END,
     HTTP2_CONNECTION_PREFACE,
@@ -18,6 +19,16 @@ from config import (
     HTTP_REQUEST_RE,
     HTTP_RESPONSE_RE,
 )
+
+try:
+    import brotli
+except ImportError:  # pragma: no cover - depends on optional runtime package
+    brotli = None
+
+try:
+    import zstandard
+except ImportError:  # pragma: no cover - depends on optional runtime package
+    zstandard = None
 
 
 # =============================================================================
@@ -143,12 +154,30 @@ def get_single_content_length(headers):
     return parsed[0]
 
 
-def get_content_encoding(headers):
-    """读取 Content-Encoding（取最后一个值）。"""
-    values = header_values(headers, b"Content-Encoding")
-    if not values:
-        return None
-    return values[-1].strip().lower()
+def parse_coding_tokens(value):
+    """解析逗号分隔的 HTTP coding 列表，忽略 coding 参数。"""
+    tokens = []
+    for part in value.split(b","):
+        token = part.split(b";", 1)[0].strip().lower()
+        if token:
+            tokens.append(token)
+    return tokens
+
+
+def get_content_codings(headers):
+    """按出现顺序读取 Content-Encoding coding 列表。"""
+    codings = []
+    for value in header_values(headers, b"Content-Encoding"):
+        codings.extend(parse_coding_tokens(value))
+    return [coding for coding in codings if coding not in (b"", b"identity")]
+
+
+def get_transfer_codings(headers):
+    """按出现顺序读取 Transfer-Encoding coding 列表。"""
+    codings = []
+    for value in header_values(headers, b"Transfer-Encoding"):
+        codings.extend(parse_coding_tokens(value))
+    return [coding for coding in codings if coding not in (b"", b"identity")]
 
 
 # =============================================================================
@@ -163,6 +192,53 @@ def is_http_request_line(start_line):
 def is_http_response_line(start_line):
     """判断 HTTP start-line 是否为响应行（HTTP/1.1 200 OK）。"""
     return bool(HTTP1_RESPONSE_LINE_RE.match(start_line))
+
+
+def http_request_method(start_line):
+    """读取 HTTP 请求方法。"""
+    if not is_http_request_line(start_line):
+        return None
+    return start_line.split(b" ", 1)[0].upper()
+
+
+def http_response_status(start_line):
+    """读取 HTTP 响应状态码。"""
+    if not is_http_response_line(start_line):
+        return None
+    try:
+        return int(start_line.split(b" ", 2)[1])
+    except (IndexError, ValueError):
+        return None
+
+
+def pending_request_method_for_response(ctx):
+    """读取当前响应对应的请求方法，用于 HEAD 响应 body 判定。"""
+    state = ctx.tcp_state()
+    methods = state.get("http_request_methods") or []
+    return methods[0] if methods else None
+
+
+def remember_http_request_method(method, ctx):
+    """记录请求方法队列，供反向响应流判断 HEAD。"""
+    if method is None or ctx.proto_name != "TCP":
+        return
+    ctx.tcp_state().setdefault("http_request_methods", []).append(method)
+
+
+def finish_http_response(status_code, ctx):
+    """最终响应处理完成后弹出对应请求方法；1xx 中间响应不弹出。"""
+    if ctx.proto_name != "TCP" or status_code is None or 100 <= status_code < 200:
+        return
+    methods = ctx.tcp_state().get("http_request_methods") or []
+    if methods:
+        methods.pop(0)
+
+
+def http_response_must_not_have_body(status_code, request_method):
+    """按 RFC body length 规则判断响应是否强制无 body。"""
+    if status_code is None:
+        return False
+    return 100 <= status_code < 200 or status_code in {204, 304} or request_method == b"HEAD"
 
 
 # =============================================================================
@@ -235,8 +311,20 @@ def build_chunked_body(chunks, trailer_block=b""):
     return bytes(out)
 
 
+def split_by_lengths(data, lengths):
+    """按原 chunk 长度列表切分数据。"""
+    chunks = []
+    pos = 0
+    for length in lengths:
+        chunks.append(data[pos:pos + length])
+        pos += length
+    if pos != len(data):
+        raise RewriteError("http.chunked.split_length_mismatch")
+    return chunks
+
+
 # =============================================================================
-# HTTP Body 编码处理（gzip/deflate/identity）
+# HTTP Body 编码处理（gzip/deflate/br/zstd/identity）
 # =============================================================================
 
 def gzip_compress_stable(data):
@@ -249,52 +337,110 @@ def gzip_compress_stable(data):
         return gzip.compress(data)
 
 
-def replace_body_with_encoding(body, content_encoding, old_ip, new_ip):
-    """
-    按 Content-Encoding 解压 body → 替换 IP → 重压缩。
-    支持 identity、gzip、deflate（含 raw deflate）。
-    不支持的编码（br/zstd）含旧 IP 时拒绝。
-    :return: (新body, 是否变化, 编码标签)
-    """
-    enc = (content_encoding or b"identity").strip().lower()
-    if enc in (b"", b"identity"):
-        new_body = body.replace(old_ip, new_ip)
-        return new_body, new_body != body, "identity"
-
-    if enc in (b"gzip", b"x-gzip"):
+def decode_coding(data, coding):
+    """按单个 HTTP coding 解码。"""
+    if coding in (b"", b"identity"):
+        return data, "identity"
+    if coding in (b"gzip", b"x-gzip"):
         try:
-            plain = gzip.decompress(body)
+            return gzip.decompress(data), "gzip"
         except (EOFError, OSError, zlib.error) as exc:
             raise RewriteError(f"http.gzip.decompress_failed:{exc}") from exc
-        if old_ip not in plain:
-            return body, False, "gzip"
-        new_plain = plain.replace(old_ip, new_ip)
-        return gzip_compress_stable(new_plain), True, "gzip"
-
-    if enc == b"deflate":
-        raw_mode = False
+    if coding == b"deflate":
         try:
-            # 先尝试标准 zlib 解压（带 header）
-            plain = zlib.decompress(body)
+            return zlib.decompress(data), "deflate"
         except zlib.error:
             try:
-                # 再尝试 raw deflate（无 header，如某些老旧服务器）
-                plain = zlib.decompress(body, -zlib.MAX_WBITS)
-                raw_mode = True
+                return zlib.decompress(data, -zlib.MAX_WBITS), "deflate.raw"
             except zlib.error as exc:
                 raise RewriteError(f"http.deflate.decompress_failed:{exc}") from exc
-        if old_ip not in plain:
-            return body, False, "deflate"
-        new_plain = plain.replace(old_ip, new_ip)
-        if raw_mode:
-            compressor = zlib.compressobj(wbits=-zlib.MAX_WBITS)
-            return compressor.compress(new_plain) + compressor.flush(), True, "deflate.raw"
-        return zlib.compress(new_plain), True, "deflate"
+    if coding == b"br":
+        if brotli is None:
+            raise RewriteError("http.br.module_missing")
+        try:
+            return brotli.decompress(data), "br"
+        except Exception as exc:
+            raise RewriteError(f"http.br.decompress_failed:{exc}") from exc
+    if coding == b"zstd":
+        if zstandard is None:
+            raise RewriteError("http.zstd.module_missing")
+        try:
+            decompressor = zstandard.ZstdDecompressor()
+            try:
+                return decompressor.decompress(data), "zstd"
+            except zstandard.ZstdError:
+                with decompressor.stream_reader(io.BytesIO(data)) as reader:
+                    return reader.read(), "zstd"
+        except Exception as exc:
+            raise RewriteError(f"http.zstd.decompress_failed:{exc}") from exc
+    raise RewriteError(f"http.unsupported_coding.{coding!r}")
 
-    # br/zstd 等暂不支持
-    if old_ip in body:
-        raise RewriteError(f"http.unsupported_content_encoding.{enc!r}_with_ip")
-    return body, False, f"unsupported_encoding.{enc!r}.skipped"
+
+def encode_coding(data, coding, variant):
+    """按单个 HTTP coding 重编码。"""
+    if coding in (b"", b"identity"):
+        return data
+    if coding in (b"gzip", b"x-gzip"):
+        return gzip_compress_stable(data)
+    if coding == b"deflate":
+        if variant == "deflate.raw":
+            compressor = zlib.compressobj(wbits=-zlib.MAX_WBITS)
+            return compressor.compress(data) + compressor.flush()
+        return zlib.compress(data)
+    if coding == b"br":
+        if brotli is None:
+            raise RewriteError("http.br.module_missing")
+        return brotli.compress(data, quality=4)
+    if coding == b"zstd":
+        if zstandard is None:
+            raise RewriteError("http.zstd.module_missing")
+        return zstandard.ZstdCompressor(level=3).compress(data)
+    raise RewriteError(f"http.unsupported_coding.{coding!r}")
+
+
+def coding_label(content_codings, transfer_codings):
+    """生成 body 编码路径标签。"""
+    labels = []
+    labels.extend(f"ce.{coding.decode('ascii', 'replace')}" for coding in content_codings)
+    labels.extend(f"te.{coding.decode('ascii', 'replace')}" for coding in transfer_codings)
+    return "+".join(labels) if labels else "identity"
+
+
+def replace_body_with_codings(body, content_codings, transfer_codings, old_ip, new_ip):
+    """
+    解码 Transfer-Encoding / Content-Encoding 后替换 IP，再按原 coding 顺序重编码。
+    Transfer-Encoding 的 chunked 分帧由调用方处理，这里只处理 gzip/deflate/br/zstd 等 coding。
+    """
+    transfer_codings = [
+        coding for coding in transfer_codings
+        if coding not in (b"", b"identity", b"chunked")
+    ]
+    content_codings = [
+        coding for coding in content_codings
+        if coding not in (b"", b"identity")
+    ]
+
+    decoded = body
+    decode_stack = []
+    for coding in reversed(transfer_codings):
+        decoded, variant = decode_coding(decoded, coding)
+        decode_stack.append((coding, variant))
+    for coding in reversed(content_codings):
+        decoded, variant = decode_coding(decoded, coding)
+        decode_stack.append((coding, variant))
+
+    label = coding_label(content_codings, transfer_codings)
+    if not contains_ip_text_boundary(decoded, old_ip):
+        return body, False, label
+
+    replaced, changed = replace_ip_text_boundary(decoded, old_ip, new_ip)
+    if not changed:
+        return body, False, label
+
+    encoded = replaced
+    for coding, variant in reversed(decode_stack):
+        encoded = encode_coding(encoded, coding, variant)
+    return encoded, True, label
 
 
 # =============================================================================
@@ -353,47 +499,52 @@ def replace_one_http1_message(data, start, ctx):
     is_response = is_http_response_line(start_line)
     if not is_request and not is_response:
         raise RewriteError("http.unknown_start_line")
+    request_method = http_request_method(start_line) if is_request else None
+    response_status = http_response_status(start_line) if is_response else None
+    response_request_method = pending_request_method_for_response(ctx) if is_response else None
 
     old_ip = ctx.old_ip
     new_ip = ctx.new_ip
 
-    # start-line 和 header values 中的 IP 文本直接替换
-    new_start_line = start_line.replace(old_ip, new_ip)
-    new_headers = [(name, value.replace(old_ip, new_ip)) for name, value in headers]
+    # start-line 和 header values 中的 IP 文本按边界替换
+    new_start_line, _ = replace_ip_text_boundary(start_line, old_ip, new_ip)
+    new_headers = [
+        (name, replace_ip_text_boundary(value, old_ip, new_ip)[0])
+        for name, value in headers
+    ]
 
-    is_chunked = has_token_header(headers, b"Transfer-Encoding", b"chunked")
+    transfer_codings = get_transfer_codings(headers)
+    is_chunked = b"chunked" in transfer_codings
     content_length = get_single_content_length(headers)
-    content_encoding = get_content_encoding(headers)
+    content_codings = get_content_codings(headers)
+    must_not_have_body = (
+        is_response
+        and http_response_must_not_have_body(response_status, response_request_method)
+    )
 
     label_suffix = ""
-    if is_chunked:
+    if must_not_have_body:
+        new_body = b""
+        consumed = body_start - start
+        label_suffix = "no_body"
+
+    elif is_chunked:
         # chunked + Content-Length 同时存在时，删除 Content-Length（RFC 7230）
         new_headers = remove_header(new_headers, b"Content-Length")
         chunks, trailer_block, consumed_body_len = parse_chunked_body(data[body_start:])
         original_body_segment = data[body_start:body_start + consumed_body_len]
-        
-        enc = (content_encoding or b"identity").strip().lower()
-        body_changed = False
-        new_chunks = []
-        
-        if enc in (b"", b"identity"):
-            # identity 编码逐 chunk 替换，保留原有 chunk 边界以准确更新每个 chunk-size
-            for chunk in chunks:
-                new_chunk = chunk.replace(old_ip, new_ip)
-                new_chunks.append(new_chunk)
-                if new_chunk != chunk:
-                    body_changed = True
-            enc_label = "identity"
-        else:
-            # 压缩的 body 需要拼接解压，替换并重压缩后作为单个大 chunk 发送
-            body_bytes = b"".join(chunks)
-            new_body_bytes, body_chunk_changed, enc_label = replace_body_with_encoding(
-                body_bytes, content_encoding, old_ip, new_ip,
-            )
-            body_changed = body_chunk_changed
+        body_bytes = b"".join(chunks)
+        new_body_bytes, body_changed, enc_label = replace_body_with_codings(
+            body_bytes, content_codings, transfer_codings, old_ip, new_ip,
+        )
+        if body_changed and len(new_body_bytes) == len(body_bytes):
+            new_chunks = split_by_lengths(new_body_bytes, [len(chunk) for chunk in chunks])
+        elif body_changed:
             new_chunks = [new_body_bytes] if new_body_bytes else []
+        else:
+            new_chunks = chunks
 
-        new_trailer = trailer_block.replace(old_ip, new_ip)
+        new_trailer, trailer_changed = replace_ip_text_boundary(trailer_block, old_ip, new_ip)
         trailer_changed = new_trailer != trailer_block
         if body_changed or trailer_changed:
             new_body = build_chunked_body(new_chunks, new_trailer)
@@ -408,8 +559,8 @@ def replace_one_http1_message(data, start, ctx):
         if body_end > len(data):
             raise RewriteError("http.body_incomplete")
         message_body = data[body_start:body_end]
-        new_body, body_changed, enc_label = replace_body_with_encoding(
-            message_body, content_encoding, old_ip, new_ip,
+        new_body, body_changed, enc_label = replace_body_with_codings(
+            message_body, content_codings, transfer_codings, old_ip, new_ip,
         )
         if body_changed:
             new_headers = set_header(new_headers, b"Content-Length", str(len(new_body)).encode("ascii"))
@@ -426,14 +577,17 @@ def replace_one_http1_message(data, start, ctx):
             label_suffix = "no_body"
         else:
             message_body = data[body_start:]
-            new_body, _, enc_label = replace_body_with_encoding(
-                message_body, content_encoding, old_ip, new_ip,
+            new_body, _, enc_label = replace_body_with_codings(
+                message_body, content_codings, transfer_codings, old_ip, new_ip,
             )
             consumed = len(data) - start
             label_suffix = f"close_delimited.{enc_label}"
 
     # 检测并更新 WebSocket 状态
+    remember_http_request_method(request_method, ctx)
     update_websocket_state_after_http(start_line, headers, ctx)
+    if is_response:
+        finish_http_response(response_status, ctx)
 
     new_header_block = serialize_http1_headers(new_start_line, new_headers)
     return new_header_block + new_body, consumed, label_suffix
@@ -460,7 +614,7 @@ def replace_in_http1(payload, ctx):
     while pos < n:
         rest = payload[pos:]
         if not looks_like_http1(rest):
-            if ctx.old_ip in rest:
+            if contains_ip_text_boundary(rest, ctx.old_ip):
                 raise RewriteError("http.trailing_unparsed_bytes_with_ip")
             output.extend(rest)
             break
@@ -473,7 +627,7 @@ def replace_in_http1(payload, ctx):
         pos += consumed
 
     new_payload = bytes(output)
-    if ctx.old_ip not in ctx.new_ip and ctx.old_ip in new_payload:
+    if not contains_ip_text_boundary(ctx.new_ip, ctx.old_ip) and contains_ip_text_boundary(new_payload, ctx.old_ip):
         raise RewriteError("http.ip_remains_after_replace")
     return new_payload, "+".join(labels) if labels else "http1"
 
@@ -492,8 +646,15 @@ def rewrite_upgrade_header_only(data, start, ctx):
         raise RewriteError("http.upgrade_header_incomplete")
     header_block = data[start:header_end]
     start_line, headers = parse_http1_headers(header_block)
-    new_start_line = start_line.replace(ctx.old_ip, ctx.new_ip)
-    new_headers = [(name, value.replace(ctx.old_ip, ctx.new_ip)) for name, value in headers]
+    new_start_line, _ = replace_ip_text_boundary(start_line, ctx.old_ip, ctx.new_ip)
+    new_headers = [
+        (name, replace_ip_text_boundary(value, ctx.old_ip, ctx.new_ip)[0])
+        for name, value in headers
+    ]
+    if is_http_response_line(start_line):
+        finish_http_response(http_response_status(start_line), ctx)
+    elif is_http_request_line(start_line):
+        remember_http_request_method(http_request_method(start_line), ctx)
     update_websocket_state_after_http(start_line, headers, ctx)
     consumed = header_end + len(HTTP_HEADER_END) - start
     return serialize_http1_headers(new_start_line, new_headers), consumed, "http1.websocket_upgrade"
@@ -544,7 +705,7 @@ def rewrite_http1_stream_safe(stream, ctx, args):
 
         header_end = stream.find(HTTP_HEADER_END, pos)
         if header_end < 0:
-            if ctx.old_ip in rest:
+            if contains_ip_text_boundary(rest, ctx.old_ip):
                 return RewriteResult(False, False, stream, "http1.stream", "http.header_incomplete")
             output.extend(rest)
             break
@@ -570,7 +731,7 @@ def rewrite_http1_stream_safe(stream, ctx, args):
         pos += consumed
 
     new_stream = bytes(output)
-    if ctx.old_ip not in ctx.new_ip and ctx.old_ip in new_stream:
+    if not contains_ip_text_boundary(ctx.new_ip, ctx.old_ip) and contains_ip_text_boundary(new_stream, ctx.old_ip):
         return RewriteResult(False, False, stream, "http1.stream", "http.ip_remains_after_replace")
     return RewriteResult(True, changed, new_stream, "+".join(labels) if labels else "http1.stream")
 

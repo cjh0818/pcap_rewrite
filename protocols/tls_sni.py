@@ -9,6 +9,7 @@ TLS ClientHello SNI 改写。
 
 from core.context import RewriteError, RewriteResult
 from core.dispatcher import ProtocolHandler
+from core.utils import contains_ip_text_boundary, replace_ip_text_boundary
 from config import TLS_CONTENT_TYPES, TLS_MINOR_VERSIONS, TLS_MAX_RECORD_LEN
 
 
@@ -66,7 +67,7 @@ def replace_in_tls(payload, old_ip, new_ip):
             pos = record_end
             continue
 
-        if old_ip not in body:
+        if not contains_ip_text_boundary(body, old_ip):
             # Handshake record 不含旧 IP，无需处理
             output.append(record_type)
             output.extend(version)
@@ -114,7 +115,7 @@ def replace_in_handshake_records(body, old_ip, new_ip):
             pos = msg_end
             continue
 
-        if old_ip not in msg_body:
+        if not contains_ip_text_boundary(msg_body, old_ip):
             output.append(msg_type)
             output.extend(msg_len.to_bytes(3, "big"))
             output.extend(msg_body)
@@ -143,7 +144,7 @@ def replace_in_client_hello(body, old_ip, new_ip):
     pos = 0
     # 前 34 字节 = 2(版本) + 32(随机数)
     fixed_head = body[pos:pos + 34]
-    if old_ip in fixed_head:
+    if contains_ip_text_boundary(fixed_head, old_ip):
         raise RewriteError("tls.client_hello.ip_in_version_or_random")
     pos += 34
 
@@ -154,7 +155,7 @@ def replace_in_client_hello(body, old_ip, new_ip):
     if pos + 1 + sid_len > n:
         raise RewriteError("tls.client_hello.session_id_overflow")
     sid_block = body[pos:pos + 1 + sid_len]
-    if old_ip in sid_block:
+    if contains_ip_text_boundary(sid_block, old_ip):
         raise RewriteError("tls.client_hello.ip_in_session_id")
     pos += 1 + sid_len
 
@@ -165,7 +166,7 @@ def replace_in_client_hello(body, old_ip, new_ip):
     if pos + 2 + cs_len > n:
         raise RewriteError("tls.client_hello.cipher_suites_overflow")
     cs_block = body[pos:pos + 2 + cs_len]
-    if old_ip in cs_block:
+    if contains_ip_text_boundary(cs_block, old_ip):
         raise RewriteError("tls.client_hello.ip_in_cipher_suites")
     pos += 2 + cs_len
 
@@ -176,7 +177,7 @@ def replace_in_client_hello(body, old_ip, new_ip):
     if pos + 1 + cm_len > n:
         raise RewriteError("tls.client_hello.compression_overflow")
     cm_block = body[pos:pos + 1 + cm_len]
-    if old_ip in cm_block:
+    if contains_ip_text_boundary(cm_block, old_ip):
         raise RewriteError("tls.client_hello.ip_in_compression_methods")
     pos += 1 + cm_len
 
@@ -218,7 +219,7 @@ def replace_in_extensions(block, old_ip, new_ip):
             pos = ext_end
             continue
 
-        if old_ip not in ext_data:
+        if not contains_ip_text_boundary(ext_data, old_ip):
             output.extend(block[pos:ext_end])
             pos = ext_end
             continue
@@ -268,12 +269,12 @@ def replace_in_server_name_list(block, old_ip, new_ip):
             raise RewriteError("tls.sni.name_overflow")
         name_data = block[pos + 3:name_end]
 
-        if name_type != 0x00 or old_ip not in name_data:
+        if name_type != 0x00 or not contains_ip_text_boundary(name_data, old_ip):
             output.extend(block[pos:name_end])
             pos = name_end
             continue
 
-        new_name = name_data.replace(old_ip, new_ip)
+        new_name, _ = replace_ip_text_boundary(name_data, old_ip, new_ip)
         if len(new_name) >= (1 << 16):
             raise RewriteError("tls.sni.name_too_long_after_replace")
         output.append(name_type)
@@ -297,7 +298,7 @@ class TLSClientHelloSNIHandler(ProtocolHandler):
         TLS 只有明文 ClientHello SNI 中有可能出现 IP 文本。
         不含旧 IP 则跳过，含则调用 replace_in_tls 进行结构化替换。
         """
-        if ctx.old_ip not in payload:
+        if not contains_ip_text_boundary(payload, ctx.old_ip):
             return RewriteResult(True, False, payload, self.name)
         new_payload = replace_in_tls(payload, ctx.old_ip, ctx.new_ip)
         return RewriteResult(True, new_payload != payload, new_payload, self.name)

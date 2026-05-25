@@ -56,6 +56,13 @@ def clear_tcp_end_flags(packet):
         packet[TCP].flags = int(packet[TCP].flags) & ~TCP_FLAG_PSH & ~TCP_FLAG_FIN
 
 
+def copy_fragment_attrs(src, dst):
+    """TCP 重分段克隆数据包时保留 FragmentManager 的回写标记。"""
+    for name in ("_fragment_marker", "_is_fragment_reassembly"):
+        if hasattr(src, name):
+            setattr(dst, name, getattr(src, name))
+
+
 def apply_segment_end_flags(active_packets, last_flags):
     """
     把原消息末片的 PSH/FIN 语义转移到新重分段后的末片上。
@@ -78,7 +85,21 @@ def find_next_reverse_ack(packets, packet_keys, start_index, key, deleted_indice
     查找当前数据片之后的反向纯 ACK（反方向流中仅 ACK 标志的包）。
     如果指定 ack_offset，则需要 ACK 确认号匹配该偏移。
     """
-    reverse_key = reverse_flow_key(key)  # 交换 src/dst 得到反方向流标识
+    for index in iter_reverse_acks_in_window(
+        packets, packet_keys, start_index, key, deleted_indices,
+        ack_offset=ack_offset, base_seq=base_seq,
+    ):
+        return index
+    return None
+
+
+def iter_reverse_acks_in_window(packets, packet_keys, start_index, key, deleted_indices,
+                                ack_offset=None, base_seq=None):
+    """
+    遍历当前数据片之后、下一个同方向数据片之前的反向纯 ACK。
+    同窗口 dup-ACK 需要一起覆盖，避免部分 ACK 仍停留在旧流坐标。
+    """
+    reverse_key = reverse_flow_key(key)
     for index in range(start_index + 1, len(packets)):
         if index in deleted_indices:  # 跳过已被标记删除的包
             continue
@@ -89,12 +110,12 @@ def find_next_reverse_ack(packets, packet_keys, start_index, key, deleted_indice
         # 必须属于反方向且是纯 ACK
         if current_key != reverse_key or not is_pure_ack(packets[index]):
             continue
-        if ack_offset is None:  # 不要求精确偏移匹配，找到第一个即可
-            return index
+        if ack_offset is None:
+            yield index
+            continue
         # 要求 ACK 确认号精确匹配到 base_seq + ack_offset
         if base_seq is not None and seq_offset(int(packets[index][TCP].ack), base_seq) == ack_offset:
-            return index
-    return None
+            yield index
 
 
 def clone_response_ack(packets, packet_keys, start_index, key, base_seq, ack_offset):
@@ -212,8 +233,7 @@ def resegment_tcp_flow(flow, packets, packet_keys, plan):
             plan.changed_indices.add(meta.index)
 
         # 查找当前数据包后紧跟的反向纯 ACK，将其确认号覆盖为新偏移
-        ack_index = find_next_reverse_ack(packets, packet_keys, meta.index, flow.key, plan.deleted_indices)
-        if ack_index is not None:
+        for ack_index in iter_reverse_acks_in_window(packets, packet_keys, meta.index, flow.key, plan.deleted_indices):
             plan.ack_overrides[ack_index] = seq_add(flow.base_seq, cursor + len(chunk))
         cursor += len(chunk)  # 推进游标
 
@@ -229,6 +249,7 @@ def resegment_tcp_flow(flow, packets, packet_keys, plan):
         # 从 new_stream 的 cursor 位置再切一块（最多 last_capacity 字节）
         chunk = flow.new_stream[cursor:cursor + last_capacity]
         piece = copy.deepcopy(last_packet)  # 以最后一个主片为模板深拷贝
+        copy_fragment_attrs(last_packet, piece)
         new_seq = seq_add(flow.base_seq, cursor)  # 计算新 SEQ
         set_l4_payload(piece[TCP], chunk)  # 填入新 payload
         piece[TCP].seq = new_seq
@@ -248,15 +269,18 @@ def resegment_tcp_flow(flow, packets, packet_keys, plan):
 
     if extra_packets:
         # 为新增包序列末尾找一个反向 ACK 确认全部数据
-        ack_index = find_next_reverse_ack(packets, packet_keys, last_primary.index, flow.key, plan.deleted_indices)
-        if ack_index is None:
+        ack_indices = list(iter_reverse_acks_in_window(
+            packets, packet_keys, last_primary.index, flow.key, plan.deleted_indices,
+        ))
+        if not ack_indices:
             # 找不到现有 ACK → 克隆一个新的确认包
             ack_packet = clone_response_ack(packets, packet_keys, last_primary.index, flow.key, flow.base_seq, len(flow.new_stream))
             if ack_packet is not None:
                 extra_packets.append(ack_packet)
         else:
             # 找到现有 ACK → 直接覆盖其确认号
-            plan.ack_overrides[ack_index] = seq_add(flow.base_seq, len(flow.new_stream))
+            for ack_index in ack_indices:
+                plan.ack_overrides[ack_index] = seq_add(flow.base_seq, len(flow.new_stream))
         # 将新增包插入到最后一片之后
         plan.insert_after[last_primary.index].extend(extra_packets)
 
@@ -265,9 +289,10 @@ def resegment_tcp_flow(flow, packets, packet_keys, plan):
         if meta.index not in plan.deleted_indices:
             continue
         # 查找与该旧包 old_end 偏移精确匹配的反向 ACK
-        ack_index = find_next_reverse_ack(packets, packet_keys, meta.index, flow.key, plan.deleted_indices,
-                                          ack_offset=meta.old_end, base_seq=flow.base_seq)
-        if ack_index is not None:
+        for ack_index in iter_reverse_acks_in_window(
+            packets, packet_keys, meta.index, flow.key, plan.deleted_indices,
+            ack_offset=meta.old_end, base_seq=flow.base_seq,
+        ):
             plan.deleted_indices.add(ack_index)  # 一并删除
 
 
@@ -361,6 +386,7 @@ def remap_retransmissions(flow, packets, plan):
         offset = len(first)  # 已放入第一个包的字节数
         for chunk in chunks[1:]:
             piece = copy.deepcopy(packet)  # 以当前包为模板深拷贝
+            copy_fragment_attrs(packet, piece)
             set_l4_payload(piece[TCP], chunk)
             piece[TCP].seq = seq_add(flow.base_seq, new_start + offset)  # 新 SEQ 递增
             clear_tcp_end_flags(piece)  # 中间分片不应有 PSH/FIN
@@ -399,7 +425,7 @@ def adjust_sack_options(tcp, state):
     return changed
 
 
-def adjust_seq_ack(packet, key, modified_flows, index=None, keep_seq=False, ack_overrides=None):
+def adjust_seq_ack(packet, key, modified_flows, index=None, keep_seq=False, keep_ack=False, ack_overrides=None):
     """
     修正 TCP 包的 seq、ack 与 SACK option。
 
@@ -431,7 +457,9 @@ def adjust_seq_ack(packet, key, modified_flows, index=None, keep_seq=False, ack_
 
     # ---- ACK 修正（反向）----
     reverse_state = modified_flows.get(reverse_flow_key(key))  # 取反方向流状态
-    if index is not None and index in ack_overrides:
+    if keep_ack:
+        pass
+    elif index is not None and index in ack_overrides:
         # 被计划强制覆盖的 ACK（来自 resegment_tcp_flow 的精确覆盖）
         new_ack = ack_overrides[index]
         if int(tcp.ack) != new_ack:
@@ -506,6 +534,7 @@ def apply_tcp_sequence_adjustments(packets, packet_keys, plan):
             if inserted_key is None:
                 continue
             if is_pure_ack(inserted):  # 纯 ACK 包的 ack 已在克隆时正确设置，跳过
+                adjust_seq_ack(inserted, inserted_key, plan.modified_flows, keep_ack=True)
                 continue
             # 新增数据包：keep_seq=True（SEQ已在重分段时精确设置，不需要二次映射）
             adjust_seq_ack(inserted, inserted_key, plan.modified_flows, keep_seq=True)

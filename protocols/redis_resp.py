@@ -6,6 +6,7 @@ BulkString($) 中的 IPv4 文本。更新 BulkString 的长度前缀。
 
 from core.context import RewriteError, RewriteResult, is_port
 from core.dispatcher import ProtocolHandler
+from core.utils import contains_ip_text_boundary, replace_ip_text_boundary
 from config import REDIS_PORT
 
 
@@ -33,7 +34,10 @@ def rewrite_resp_element(data, pos, ctx):
     # SimpleString(+)、Error(-)、Integer(:)：读取一行，只对 + 和 - 做文本替换
     if prefix in (b"+", b"-", b":"):
         line, new_pos = read_resp_line(data, pos + 1)
-        new_line = line.replace(ctx.old_ip, ctx.new_ip) if prefix in (b"+", b"-") else line
+        if prefix in (b"+", b"-"):
+            new_line, changed = replace_ip_text_boundary(line, ctx.old_ip, ctx.new_ip)
+        else:
+            new_line, changed = line, False
         return prefix + new_line + b"\r\n", new_pos, new_line != line
 
     # BulkString($): 读取长度行 + 数据块，替换后更新长度
@@ -53,7 +57,7 @@ def rewrite_resp_element(data, pos, ctx):
         if data[data_end:data_end + 2] != b"\r\n":
             raise RewriteError("redis.bulk_missing_crlf")
         bulk_data = data[data_start:data_end]
-        new_bulk = bulk_data.replace(ctx.old_ip, ctx.new_ip)
+        new_bulk, _ = replace_ip_text_boundary(bulk_data, ctx.old_ip, ctx.new_ip)
         rewritten = (
             b"$" + str(len(new_bulk)).encode("ascii") + b"\r\n"
             + new_bulk + b"\r\n"
@@ -110,7 +114,7 @@ class RedisRESPHandler(ProtocolHandler):
                 out.extend(elem)
                 changed = changed or elem_changed
         except RewriteError:
-            if ctx.old_ip in payload:
+            if contains_ip_text_boundary(payload, ctx.old_ip):
                 raise
             return RewriteResult(True, False, payload, "redis.unparsed_without_ip")
         label = "redis.resp" if changed else "redis.unchanged"

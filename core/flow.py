@@ -12,7 +12,7 @@ from collections import defaultdict
 from scapy.layers.inet import IP, TCP
 from core.context import SegmentMeta, TcpFlowState
 from core.utils import real_tcp_payload, seq_offset
-from config import TCP_FLAG_SYN, TCP_FLAG_ACK
+from config import TCP_FLAG_SYN, TCP_FLAG_ACK, TCP_FLAG_FIN, TCP_FLAG_RST, TCP_SEQ_HALF, TCP_SEQ_MOD
 
 
 def endpoint_pair(ip_layer, tcp_layer):
@@ -32,19 +32,42 @@ def assign_tcp_generations(packets):
     """
     generations = {}
     packet_generations = {}
+    ended_pairs = set()
+    last_seq_by_direction = {}
     for index, packet in enumerate(packets):
-        if not (IP in packet and TCP in packet):
+        if packet is None or not (IP in packet and TCP in packet):
             continue
         pair = endpoint_pair(packet[IP], packet[TCP])
         flags = int(packet[TCP].flags)
         syn = bool(flags & TCP_FLAG_SYN)
         ack = bool(flags & TCP_FLAG_ACK)
+        payload = real_tcp_payload(packet)
+        direction = (
+            pair,
+            packet[IP].src,
+            int(packet[TCP].sport),
+            packet[IP].dst,
+            int(packet[TCP].dport),
+        )
         # SYN 且无 ACK = 新连接发起（三次握手第一步）
         if syn and not ack:
             generations[pair] = generations.get(pair, 0) + 1
+            ended_pairs.discard(pair)
+        elif payload and pair in ended_pairs:
+            # mid-stream 抓包看不到新 SYN 时，FIN/RST 后的新数据视为下一代连接。
+            generations[pair] = generations.get(pair, 0) + 1
+            ended_pairs.discard(pair)
+        elif payload and direction in last_seq_by_direction:
+            seq_jump = (int(packet[TCP].seq) - last_seq_by_direction[direction]) % TCP_SEQ_MOD
+            if seq_jump >= TCP_SEQ_HALF:
+                generations[pair] = generations.get(pair, 0) + 1
         elif pair not in generations:
             generations[pair] = 0
         packet_generations[index] = generations.get(pair, 0)
+        if payload:
+            last_seq_by_direction[direction] = int(packet[TCP].seq)
+        if flags & (TCP_FLAG_FIN | TCP_FLAG_RST):
+            ended_pairs.add(pair)
     return packet_generations
 
 
@@ -82,6 +105,8 @@ def collect_tcp_flows(packets):
     packet_keys = {}
     indices_by_key = defaultdict(list)
     for index, packet in enumerate(packets):
+        if packet is None or is_ipv4_fragment(packet):
+            continue
         key = make_flow_key(packet, packet_generations.get(index, 0))
         if key is None:
             continue
@@ -94,6 +119,17 @@ def collect_tcp_flows(packets):
         if state is not None:
             flows[key] = state
     return flows, packet_keys
+
+
+def is_ipv4_fragment(packet):
+    """判断 IPv4 包是否为分片；分片 L4 payload 不进入现有 TCP 流重组。"""
+    if IP not in packet:
+        return False
+    ip = packet[IP]
+    try:
+        return int(ip.frag) > 0 or bool(int(ip.flags) & 0x1)
+    except (TypeError, ValueError):
+        return False
 
 
 def build_stream_state(key, packet_indices, packets):

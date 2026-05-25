@@ -72,7 +72,7 @@ class HandlerDispatcher:
         # tuple 防止运行中被外部代码意外增删 handler。
         self.handlers = tuple(handlers)
 
-    def rewrite(self, payload, ctx):
+    def rewrite(self, payload, ctx, exclude=None):
         """
         对单段应用层 payload 执行"选择 handler -> 改写 -> 返回"。
         :param payload: 协议负载字节串
@@ -80,26 +80,29 @@ class HandlerDispatcher:
         :return: RewriteResult
         """
         # 每个 payload 只交给一个 handler，避免 HTTP body 被 raw fallback 二次替换。
-        handler = self._select_handler(payload, ctx)
+        handler = self._select_handler(payload, ctx, exclude=exclude)
         if handler is None:
             return RewriteResult(True, False, payload, "none")
         return self._rewrite_with_handler(handler, payload, ctx)
 
-    def select_handler(self, payload, ctx):
+    def select_handler(self, payload, ctx, exclude=None):
         """
         仅执行 detect 阶段，返回命中的 handler 或 None。
         供上层在调用 rewrite 之前判断 handler 的元属性（如 requires_stream_merge）。
         """
-        return self._select_handler(payload, ctx)
+        return self._select_handler(payload, ctx, exclude=exclude)
 
-    def _select_handler(self, payload, ctx):
+    def _select_handler(self, payload, ctx, exclude=None):
         """
         从 handler 列表中选择第一个声明可处理当前 payload 的 handler。
         :param payload: 协议负载字节串
         :param ctx: RewriteContext
         :return: 命中的 ProtocolHandler 或 None
         """
+        exclude = exclude or set()
         for handler in self.handlers:
+            if handler.name in exclude or handler.__class__ in exclude:
+                continue
             try:
                 if handler.detect(payload, ctx):
                     return handler

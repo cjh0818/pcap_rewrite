@@ -13,9 +13,9 @@ import zlib
 from loguru import logger
 from scapy.layers.inet import IP, TCP, UDP
 from core.context import RewriteContext, RewriteError, TcpRewritePlan
-from core.flow import collect_tcp_flows
+from core.flow import collect_tcp_flows, is_ipv4_fragment
 from core.resegment import apply_tcp_sequence_adjustments, resegment_preserve, resegment_tcp_flows
-from core.utils import compute_edits, real_udp_payload, replace_binary_ipv4, set_l4_payload, clear_autofields
+from core.utils import compute_edits, real_udp_payload, set_l4_payload, clear_autofields
 from protocols import TCP_DISPATCHER, UDP_DISPATCHER
 from protocols.http1 import rewrite_http1_stream_safe
 from config import HTTP_REQUEST_RE, HTTP_RESPONSE_RE, DEFAULT_UDP_MAX_PAYLOAD
@@ -33,6 +33,9 @@ def rewrite_udp_packet(packet, index, args, stats):
     """
     if not (IP in packet and UDP in packet):
         return
+    if is_ipv4_fragment(packet):
+        logger.warning(f"帧#{index} IPv4 分片 UDP payload 跳过应用层改写")
+        return
     udp = packet[UDP]
     payload = real_udp_payload(packet)  # 裁掉以太网尾部 padding 后的真实 UDP payload
     ctx = RewriteContext(args, packet[IP], udp, "UDP", index, None, None, {})  # 构建改写上下文
@@ -45,19 +48,17 @@ def rewrite_udp_packet(packet, index, args, stats):
 
     new_payload = result.payload
     changed = result.changed
-    # raw handler 输出的 payload 还需要做 packed 二进制 IPv4 替换（4字节大端IP）
-    if result.label in {"tcp.raw", "udp.raw"}:
-        bin_payload, bin_changed = replace_binary_ipv4(new_payload, args)
-        if bin_changed:
-            new_payload = bin_payload
-            changed = True
-
     if not changed:
         return
-    # 改写后 payload 超过 MTU 阈值时回滚，避免生成异常大包
-    if len(new_payload) > DEFAULT_UDP_MAX_PAYLOAD:
+    # 普通 UDP 包仍受单帧 MTU 约束；由 FragmentManager 重组出来的虚拟包
+    # 会在输出阶段重新切成 IPv4 分片，因此不能按 1472 字节回滚。
+    if len(new_payload) > DEFAULT_UDP_MAX_PAYLOAD and not getattr(packet, "_is_fragment_reassembly", False):
         stats.failures += 1
         logger.error(f"帧#{index} UDP payload 超过阈值 {len(new_payload)}>{DEFAULT_UDP_MAX_PAYLOAD}，已回滚")
+        return
+    if len(new_payload) > 65507:
+        stats.failures += 1
+        logger.error(f"帧#{index} UDP payload 超过协议上限 {len(new_payload)}>65507，已回滚")
         return
 
     set_l4_payload(udp, new_payload)  # 写入新 payload
@@ -77,6 +78,8 @@ def rewrite_l2_l3_udp_pass(packets, args, stats):
 
     for index, packet in enumerate(packets, start=1):  # 帧号从 1 开始
         stats.total_in += 1
+        if packet is None:  # 分片重组后的续片占位，输出阶段会还原
+            continue
         # ARP 是链路层协议（EthType=0x0806），不含 IP 层，改写后无需继续处理
         if rewrite_arp(packet, index, args, stats):
             continue
@@ -138,18 +141,10 @@ def rewrite_tcp_stream(flow, packets, args, flow_state):
 
     new_stream = result.payload
     changed = result.changed
-    bin_changed = False
-    # raw handler 输出的流还需要做 packed 二进制替换（4字节大端 IPv4）
-    if result.label in {"tcp.raw", "udp.raw"}:
-        bin_stream, bin_changed = replace_binary_ipv4(new_stream, args)
-        if bin_changed:
-            new_stream = bin_stream
-            changed = True
-
     # 保存改写结果到流状态
     flow.new_stream = new_stream
     flow.edits = compute_edits(flow.old_stream, flow.new_stream)  # 计算编辑区间
-    flow.label = result.label + ("+binary" if bin_changed else "")
+    flow.label = result.label
     return changed or bool(flow.edits)
 
 
@@ -233,6 +228,8 @@ def build_output_packets(packets, plan, stats):
     """
     output_packets = []
     for index, packet in enumerate(packets):
+        if packet is None:
+            continue
         if index in plan.deleted_indices:  # 跳过标记删除的包
             continue
         output_packets.append(packet)

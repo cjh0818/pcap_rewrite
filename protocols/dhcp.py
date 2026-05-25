@@ -3,7 +3,7 @@
 DHCP/BOOTP 协议改写。
 
 支持固定 IPv4 字段 ciaddr/yiaddr/siaddr/giaddr，以及 Scapy 已解析为
-IPv4 字符串的 DHCP options。未能结构化定位但含旧 IP 的 DHCP payload 会跳过而非抛异常。
+IPv4 字符串的 DHCP options。未能结构化定位但含旧 IP 的 DHCP payload 会拒绝。
 """
 
 from scapy.layers.dhcp import BOOTP, DHCP
@@ -66,7 +66,7 @@ def rewrite_dhcp_payload(payload, ctx):
     """改写 BOOTP/DHCP payload。返回 (payload, changed, label)。"""
     if not looks_like_bootp(payload):
         if has_old_material(payload, ctx):
-            return payload, False, "dhcp.invalid_bootp_skipped"
+            raise RewriteError("dhcp.invalid_bootp_with_ip")
         return payload, False, "dhcp.unchanged"
 
     bootp = BOOTP(payload)
@@ -90,7 +90,7 @@ def rewrite_dhcp_payload(payload, ctx):
 
     if not changed:
         if has_old_material(payload, ctx):
-            return payload, False, "dhcp.unsupported_field_skipped"
+            raise RewriteError("dhcp.unsupported_field_with_ip")
         return payload, False, "dhcp.unchanged"
 
     new_payload = bytes(bootp)

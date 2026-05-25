@@ -5,6 +5,7 @@ QUIC 识别与拒绝：QUIC 是加密协议，无法安全替换。
 
 from core.context import RewriteResult
 from core.dispatcher import ProtocolHandler
+from core.utils import contains_ip_text_boundary
 from config import COMMON_QUIC_PORTS
 
 
@@ -34,6 +35,6 @@ class QUICRejectHandler(ProtocolHandler):
 
     def rewrite(self, payload, ctx):
         """含旧 IP 时拒绝，不含时安全跳过。"""
-        if ctx.old_ip in payload:
+        if contains_ip_text_boundary(payload, ctx.old_ip):
             return RewriteResult(False, False, payload, self.name, "quic.with_ip_not_supported")
         return RewriteResult(True, False, payload, "quic.unchanged")

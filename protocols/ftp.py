@@ -10,6 +10,7 @@ import re
 
 from core.context import RewriteResult, is_port
 from core.dispatcher import ProtocolHandler
+from core.utils import IP_COMMA_BOUNDARY_BYTES, replace_ip_text_boundary
 from config import FTP_CONTROL_PORT, SMTP_PORTS
 
 
@@ -40,14 +41,16 @@ def rewrite_ftp_payload(payload, ctx):
     """替换 dotted IPv4 和逗号分隔 IPv4。"""
     new_payload = payload
     labels = []
-    if ctx.old_ip in new_payload:
-        new_payload = new_payload.replace(ctx.old_ip, ctx.new_ip)
+    new_payload, ascii_changed = replace_ip_text_boundary(new_payload, ctx.old_ip, ctx.new_ip)
+    if ascii_changed:
         labels.append("ascii")
 
     old_comma = ctx.args.old_ip.replace(".", ",").encode("ascii")
     new_comma = ctx.args.new_ip.replace(".", ",").encode("ascii")
-    if old_comma in new_payload:
-        new_payload = new_payload.replace(old_comma, new_comma)
+    new_payload, comma_changed = replace_ip_text_boundary(
+        new_payload, old_comma, new_comma, boundary_bytes=IP_COMMA_BOUNDARY_BYTES,
+    )
+    if comma_changed:
         labels.append("comma")
 
     return new_payload, new_payload != payload, "+".join(labels) if labels else "unchanged"

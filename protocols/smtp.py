@@ -10,6 +10,7 @@ import re
 
 from core.context import RewriteResult
 from core.dispatcher import ProtocolHandler
+from core.utils import contains_ip_text_boundary, replace_ip_text_boundary
 from config import SMTP_PORTS
 
 
@@ -43,7 +44,7 @@ class SMTPHandler(ProtocolHandler):
         return ctx.proto_name == "TCP" and payload and (is_smtp_port(ctx) or looks_like_smtp(payload))
 
     def rewrite(self, payload, ctx):
-        if ctx.old_ip not in payload:
+        if not contains_ip_text_boundary(payload, ctx.old_ip):
             return RewriteResult(True, False, payload, "smtp.unchanged")
-        new_payload = payload.replace(ctx.old_ip, ctx.new_ip)
+        new_payload, _ = replace_ip_text_boundary(payload, ctx.old_ip, ctx.new_ip)
         return RewriteResult(True, True, new_payload, "smtp.ascii")

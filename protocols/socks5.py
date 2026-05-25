@@ -5,12 +5,13 @@ SOCKS5 协议改写：替换请求中的 IPv4 地址（ATYP=0x01）和域名（A
 
 安全边界：
 - 传入的是完整 TCP 单方向字节流，逐消息解析
-- 不支持的 ATYP（IPv6 / 未知类型）或畸形消息中含旧 IP 时，跳过该消息而不抛异常，
-  避免回滚整条 TCP stream 中已完成的改写
+- 握手后的代理流量重新交给 TCP dispatcher 识别内层协议
+- 不支持的 ATYP（IPv6 / 未知类型）或畸形消息中含旧 IP 时拒绝，避免静默漏改
 """
 
-from core.context import RewriteResult, is_port
+from core.context import RewriteError, RewriteResult, is_port
 from core.dispatcher import ProtocolHandler
+from core.utils import contains_ip_text_boundary, replace_ip_text_boundary
 from config import SOCKS_PORT
 
 
@@ -44,7 +45,14 @@ class SOCKS5Handler(ProtocolHandler):
 
         while pos < len(buf):
             if buf[pos] != 0x05:
-                labels.append(self._unrecognized_label(bytes(buf[pos:]), ctx))
+                tail = bytes(buf[pos:])
+                from protocols import TCP_DISPATCHER
+                result = TCP_DISPATCHER.rewrite(tail, ctx, exclude={SOCKS5Handler})
+                if not result.ok:
+                    return RewriteResult(False, False, payload, f"socks5.tail.{result.label}", result.reason)
+                buf[pos:] = result.payload
+                changed = changed or result.changed
+                labels.append(f"tail.{result.label}")
                 break
 
             parsed = self._rewrite_request_message(buf, pos, ctx)
@@ -54,13 +62,13 @@ class SOCKS5Handler(ProtocolHandler):
                 labels.append(label)
                 continue
 
-            parsed = self._skip_method_selection_message(buf, pos)
+            parsed = self._skip_greeting_message(buf, pos)
             if parsed is not None:
                 pos, label = parsed
                 labels.append(label)
                 continue
 
-            parsed = self._skip_greeting_message(buf, pos)
+            parsed = self._skip_method_selection_message(buf, pos)
             if parsed is not None:
                 pos, label = parsed
                 labels.append(label)
@@ -85,7 +93,9 @@ class SOCKS5Handler(ProtocolHandler):
         if atyp == 0x01:  # IPv4 二进制，固定 4 字节
             end = addr_pos + 4 + 2
             if len(buf) < end:
-                label = "socks5.ipv4_incomplete_skipped" if ctx.old_ip in bytes(buf[pos:]) else "socks5.ipv4_incomplete"
+                if contains_ip_text_boundary(bytes(buf[pos:]), ctx.old_ip):
+                    raise RewriteError("socks5.ipv4_incomplete_with_ip")
+                label = "socks5.ipv4_incomplete"
                 return False, len(buf), label
             addr = bytes(buf[addr_pos:addr_pos + 4])
             changed = False
@@ -98,22 +108,28 @@ class SOCKS5Handler(ProtocolHandler):
 
         if atyp == 0x03:  # 域名：1 字节长度 + 域名 + 2 字节端口
             if len(buf) < addr_pos + 1:
-                label = "socks5.domain_missing_len_skipped" if ctx.old_ip in bytes(buf[pos:]) else "socks5.domain_missing_len"
+                if contains_ip_text_boundary(bytes(buf[pos:]), ctx.old_ip):
+                    raise RewriteError("socks5.domain_missing_len_with_ip")
+                label = "socks5.domain_missing_len"
                 return False, len(buf), label
             dom_len = buf[addr_pos]
             dom_start = addr_pos + 1
             dom_end = dom_start + dom_len
             end = dom_end + 2
             if len(buf) < end:
-                label = "socks5.domain_incomplete_skipped" if ctx.old_ip in bytes(buf[pos:]) else "socks5.domain_incomplete"
+                if contains_ip_text_boundary(bytes(buf[pos:]), ctx.old_ip):
+                    raise RewriteError("socks5.domain_incomplete_with_ip")
+                label = "socks5.domain_incomplete"
                 return False, len(buf), label
             domain = bytes(buf[dom_start:dom_end])
-            new_domain = domain.replace(ctx.old_ip, ctx.new_ip)
+            new_domain, domain_changed = replace_ip_text_boundary(domain, ctx.old_ip, ctx.new_ip)
             if len(new_domain) > 255:
-                label = "socks5.domain_too_long_skipped" if ctx.old_ip in bytes(buf[pos:end]) else "socks5.domain_too_long"
+                if contains_ip_text_boundary(bytes(buf[pos:end]), ctx.old_ip):
+                    raise RewriteError("socks5.domain_too_long_with_ip")
+                label = "socks5.domain_too_long"
                 return False, end, label
             changed = False
-            if new_domain != domain:
+            if domain_changed:
                 buf[addr_pos] = len(new_domain)
                 buf[dom_start:dom_end] = new_domain
                 end = dom_start + len(new_domain) + 2
@@ -124,9 +140,13 @@ class SOCKS5Handler(ProtocolHandler):
         if atyp == 0x04:  # IPv6 — 不支持，跳过而非抛异常
             end = addr_pos + 16 + 2
             if len(buf) < end:
-                label = "socks5.ipv6_incomplete_skipped" if ctx.old_ip in bytes(buf[pos:]) else "socks5.ipv6_incomplete"
+                if contains_ip_text_boundary(bytes(buf[pos:]), ctx.old_ip):
+                    raise RewriteError("socks5.ipv6_incomplete_with_ip")
+                label = "socks5.ipv6_incomplete"
                 return False, len(buf), label
-            label = "socks5.ipv6_with_ip_skipped" if ctx.old_ip in bytes(buf[pos:end]) else "socks5.ipv6.unchanged"
+            if contains_ip_text_boundary(bytes(buf[pos:end]), ctx.old_ip):
+                raise RewriteError("socks5.ipv6_with_ip_not_supported")
+            label = "socks5.ipv6.unchanged"
             return False, end, label
 
         return None
@@ -140,8 +160,6 @@ class SOCKS5Handler(ProtocolHandler):
         end = pos + 2 + buf[pos + 1]
         if len(buf) < end:
             return None
-        if end < len(buf) and buf[end] != 0x05:
-            return None
         return end, "socks5.greeting"
 
     def _skip_method_selection_message(self, buf, pos):
@@ -149,19 +167,21 @@ class SOCKS5Handler(ProtocolHandler):
         if len(buf) < pos + 2:
             return None
         end = pos + 2
-        if end < len(buf) and buf[end] != 0x05:
-            return None
         return end, "socks5.method_selection"
 
     def _unsupported_or_incomplete_label(self, payload, ctx):
         """保留旧逻辑：未知 ATYP 或畸形消息中含旧 IP 时只跳过。"""
         if len(payload) >= 4 and payload[0] == 0x05 and payload[2] == 0x00:
             atyp = payload[3]
-            return f"socks5.atyp_{atyp:#x}_with_ip_skipped" if ctx.old_ip in payload else "socks5.unchanged"
+            if contains_ip_text_boundary(payload, ctx.old_ip):
+                raise RewriteError(f"socks5.atyp_{atyp:#x}_with_ip_not_supported")
+            return "socks5.unchanged"
         return self._unrecognized_label(payload, ctx)
 
     def _unrecognized_label(self, payload, ctx):
-        return "socks5.unrecognized_with_ip_skipped" if ctx.old_ip in payload else "socks5.unrecognized_without_ip"
+        if contains_ip_text_boundary(payload, ctx.old_ip):
+            raise RewriteError("socks5.unrecognized_with_ip")
+        return "socks5.unrecognized_without_ip"
 
     def _label(self, labels):
         if not labels:

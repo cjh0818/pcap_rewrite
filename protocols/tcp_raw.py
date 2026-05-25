@@ -6,12 +6,14 @@ TCP Raw 兜底处理器：当所有结构化协议 handler 都无法识别时，
 
 from core.context import RewriteResult
 from core.dispatcher import ProtocolHandler
+from core.utils import general_replace_payload
 
 
 class RawTCPHandler(ProtocolHandler):
     """TCP Raw fallback：字节级兜底替换。"""
 
     name = "tcp.raw"
+    requires_stream_merge = True
 
     def detect(self, payload, ctx):
         """TCP 协议永远可被 raw handler 兜底。"""
@@ -19,9 +21,7 @@ class RawTCPHandler(ProtocolHandler):
 
     def rewrite(self, payload, ctx):
         """
-        对 TCP payload 执行 ASCII 文本替换。
+        对 TCP payload 执行安全文本替换和非文本上下文 packed IPv4 兜底。
         """
-        if ctx.old_ip not in payload:
-            return RewriteResult(True, False, payload, self.name)
-        new_payload = payload.replace(ctx.old_ip, ctx.new_ip)
-        return RewriteResult(True, True, new_payload, self.name)
+        new_payload, changed, label = general_replace_payload(payload, ctx.args)
+        return RewriteResult(True, changed, new_payload, f"{self.name}.{label}")

@@ -6,6 +6,7 @@ WebSocket 协议改写：解析 WebSocket frame，对 text(opcode=0x1) 消息
 
 from core.context import RewriteError, RewriteResult
 from core.dispatcher import ProtocolHandler
+from core.utils import contains_ip_text_boundary, replace_ip_text_boundary
 
 
 def websocket_state_established(ctx):
@@ -46,7 +47,7 @@ def rewrite_websocket_frames(payload, ctx):
     state = ctx.tcp_state()
     # permessage-deflate 需要按消息边界解压，包级处理不安全
     if state.get("websocket_permessage_deflate"):
-        if ctx.old_ip in payload:
+        if contains_ip_text_boundary(payload, ctx.old_ip):
             raise RewriteError("websocket.permessage_deflate_with_ip")
         return payload
 
@@ -104,11 +105,11 @@ def rewrite_websocket_frames(payload, ctx):
         # 控制帧 (Close/Ping/Pong) 含旧 IP 原样保留，不影响同 stream 的 text frame
         if opcode in {0x8, 0x9, 0xA}:
             new_decoded = decoded
-        elif ctx.old_ip in decoded:
+        elif contains_ip_text_boundary(decoded, ctx.old_ip):
             if not fin:
                 raise RewriteError("websocket.fragmented_text_with_ip_not_supported")
             if opcode == 0x1:
-                new_decoded = decoded.replace(ctx.old_ip, ctx.new_ip)
+                new_decoded, _ = replace_ip_text_boundary(decoded, ctx.old_ip, ctx.new_ip)
             elif opcode == 0x2:
                 raise RewriteError("websocket.binary_with_ip_not_supported")
             else:
