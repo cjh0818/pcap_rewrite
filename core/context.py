@@ -20,12 +20,14 @@ class RewriteResult:
     :param payload: handler 输出的协议负载字节串，失败时通常等于输入字节串。
     :param label: 协议标签，用于日志定位具体处理器和子路径。
     :param reason: 拒绝或失败原因，便于批处理不中断时追踪风险包。
+    :param requires_stream_merge: 动态覆盖 handler 的 TCP 重分段策略；None 表示使用静态属性。
     """
     ok: bool
     changed: bool
     payload: bytes
     label: str
     reason: str = ""
+    requires_stream_merge: object = None
 
 
 @dataclass

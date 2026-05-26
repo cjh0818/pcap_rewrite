@@ -43,6 +43,7 @@ class SOCKS5Handler(ProtocolHandler):
         pos = 0
         changed = False
         labels = []
+        requires_stream_merge = None
 
         while pos < len(buf):
             if buf[pos] != 0x05:
@@ -52,6 +53,7 @@ class SOCKS5Handler(ProtocolHandler):
                     return RewriteResult(False, False, payload, f"socks5.tail.{result.label}", result.reason)
                 buf[pos:] = result.payload
                 changed = changed or result.changed
+                requires_stream_merge = result.requires_stream_merge
                 labels.append(f"tail.{result.label}")
                 break
 
@@ -59,6 +61,9 @@ class SOCKS5Handler(ProtocolHandler):
             if parsed is not None:
                 msg_changed, pos, label = parsed
                 changed = changed or msg_changed
+                if msg_changed and len(buf) != len(payload):
+                    # SOCKS5 域名型请求可变长；变长后不应强行保留旧 TCP segment 边界。
+                    requires_stream_merge = True
                 labels.append(label)
                 continue
 
@@ -77,7 +82,13 @@ class SOCKS5Handler(ProtocolHandler):
             labels.append(self._unsupported_or_incomplete_label(bytes(buf[pos:]), ctx))
             break
 
-        return RewriteResult(True, changed, bytes(buf), self._label(labels))
+        return RewriteResult(
+            True,
+            changed,
+            bytes(buf),
+            self._label(labels),
+            requires_stream_merge=requires_stream_merge,
+        )
 
     def _rewrite_tunnel_tail(self, tail, ctx):
         """SOCKS 握手后的 HTTP/WebSocket 流量必须走 HTTP 流级安全入口。"""
@@ -88,9 +99,16 @@ class SOCKS5Handler(ProtocolHandler):
             or ws_state.get("websocket_pending")
             or ws_state.get("websocket_established")
         ):
-            return rewrite_http1_stream_safe(tail, ctx, ctx.args)
+            result = rewrite_http1_stream_safe(tail, ctx, ctx.args)
+            result.requires_stream_merge = True
+            return result
         from protocols import TCP_DISPATCHER
-        return TCP_DISPATCHER.rewrite(tail, ctx, exclude={SOCKS5Handler})
+        handler = TCP_DISPATCHER.select_handler(tail, ctx, exclude={SOCKS5Handler})
+        result = TCP_DISPATCHER.rewrite(tail, ctx, exclude={SOCKS5Handler})
+        inner_requires_merge = bool(getattr(handler, "requires_stream_merge", False))
+        # 内层协议要求合并，或 tunnel tail 发生变长改写时，把策略冒泡给外层 SOCKS5 流。
+        result.requires_stream_merge = inner_requires_merge or len(result.payload) != len(tail)
+        return result
 
     def _rewrite_request_message(self, buf, pos, ctx):
         """改写单个 Request/Reply 消息；不是该消息时返回 None。"""

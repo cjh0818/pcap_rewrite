@@ -519,6 +519,12 @@ class FragmentManager:
 
     @classmethod
     def _split_boundaries(cls, total_len, original_sizes, max_payload):
+        """
+        生成回切边界。
+
+        等长改写保留原始分片节奏；长度变化时按当前 MTU 重切，避免把
+        中间链路造成的分片节奏当成源端协议特征长期保留。
+        """
         if sum(original_sizes) == total_len and len(original_sizes) > 1:
             boundaries = []
             pos = 0
@@ -527,71 +533,20 @@ class FragmentManager:
                 pos += size
             return boundaries
 
-        if len(original_sizes) > 1:
-            boundaries = cls._split_by_original_slots(total_len, original_sizes, max_payload)
-            if boundaries:
-                return boundaries
-
-        boundaries = []
-        pos = 0
-        while pos < total_len:
-            end = min(pos + max_payload, total_len)
-            boundaries.append((pos, end))
-            pos = end
-        return boundaries
-
-    @staticmethod
-    def _split_by_original_slots(total_len, original_sizes, max_payload):
-        """
-        长度变化时仍优先按原始 fragment slots 分配。
-
-        IPv4 要求非末片 payload 长度是 8 的倍数；如果改写后短到无法
-        形成至少两个非空分片（例如 UDP 只剩 8 字节），只能退回单片。
-        """
-        if total_len <= 8:
+        if total_len <= max_payload:
             return [(0, total_len)]
 
         boundaries = []
+        fragment_payload = (max_payload // 8) * 8
+        if fragment_payload <= 0:
+            fragment_payload = 1480
         pos = 0
-        slot_count = len(original_sizes)
-        for slot_index, original_size in enumerate(original_sizes):
-            remaining = total_len - pos
-            if remaining <= 0:
-                break
-
-            is_original_last_slot = slot_index == slot_count - 1
-            if is_original_last_slot:
-                end = total_len if remaining <= max_payload else pos + max_payload
-            else:
-                later_slots = slot_count - slot_index - 1
-                min_tail = later_slots
-                capacity = min(original_size, max_payload, max(0, remaining - min_tail))
-                capacity = (capacity // 8) * 8
-                if capacity <= 0:
-                    break
-                end = pos + capacity
-
-            if end <= pos:
-                break
-            boundaries.append((pos, end))
-            pos = end
-
         while pos < total_len:
             remaining = total_len - pos
             if remaining <= max_payload:
                 boundaries.append((pos, total_len))
                 break
-            end = pos + max_payload
-            end = pos + ((end - pos) // 8) * 8
-            if end <= pos:
-                return []
+            end = pos + fragment_payload
             boundaries.append((pos, end))
             pos = end
-
-        if len(boundaries) == 1 and total_len > 8:
-            first_end = min(max_payload, total_len - 1)
-            first_end = (first_end // 8) * 8
-            if first_end <= 0:
-                return boundaries
-            return [(0, first_end), (first_end, total_len)]
         return boundaries

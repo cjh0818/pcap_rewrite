@@ -139,6 +139,10 @@ def rewrite_tcp_stream(flow, packets, args, flow_state):
         flow.label = result.label
         return False
 
+    if result.requires_stream_merge is not None:
+        # SOCKS5 等外层 handler 会在 rewrite 后才知道内层协议是否需要流级重分段。
+        flow.preserve_boundaries = not result.requires_stream_merge
+
     new_stream = result.payload
     changed = result.changed
     # 保存改写结果到流状态
