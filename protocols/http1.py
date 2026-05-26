@@ -614,14 +614,23 @@ def replace_in_http1(payload, ctx):
     while pos < n:
         rest = payload[pos:]
         if not looks_like_http1(rest):
-            if contains_ip_text_boundary(rest, ctx.old_ip):
-                raise RewriteError("http.trailing_unparsed_bytes_with_ip")
-            output.extend(rest)
+            new_tail, tail_changed, ext_label = general_replace_payload(rest, ctx.args)
+            if tail_changed:
+                labels.append(f"tail_unparsed.{ext_label}")
+            output.extend(new_tail)
             break
 
-        new_msg, consumed, label = replace_one_http1_message(payload, pos, ctx)
-        if consumed <= 0:
-            raise RewriteError("http.zero_consumed")
+        try:
+            new_msg, consumed, label = replace_one_http1_message(payload, pos, ctx)
+            if consumed <= 0:
+                raise RewriteError("http.zero_consumed")
+        except RewriteError:
+            new_tail, tail_changed, ext_label = general_replace_payload(rest, ctx.args)
+            if tail_changed:
+                labels.append(f"tail_error_fallback.{ext_label}")
+            output.extend(new_tail)
+            break
+
         output.extend(new_msg)
         labels.append(label)
         pos += consumed
@@ -705,24 +714,34 @@ def rewrite_http1_stream_safe(stream, ctx, args):
 
         header_end = stream.find(HTTP_HEADER_END, pos)
         if header_end < 0:
-            if contains_ip_text_boundary(rest, ctx.old_ip):
-                return RewriteResult(False, False, stream, "http1.stream", "http.header_incomplete")
-            output.extend(rest)
+            new_tail, tail_changed, ext_label = general_replace_payload(rest, args)
+            if tail_changed:
+                changed = True
+                labels.append(f"tail_incomplete_header.{ext_label}")
+            output.extend(new_tail)
             break
 
-        header_block = stream[pos:header_end]
-        start_line, headers = parse_http1_headers(header_block)
-
-        # Upgrade 响应只改写头部，后续数据交给 WebSocket handler
-        if (
-            is_http_response_line(start_line)
-            and start_line.startswith(b"HTTP/1.1 101")
-            and has_token_header(headers, b"Upgrade", b"websocket")
-        ):
-            new_msg, consumed, label = rewrite_upgrade_header_only(stream, pos, ctx)
-        else:
-            new_msg, consumed, suffix = replace_one_http1_message(stream, pos, ctx)
-            label = f"http1.{suffix}"
+        try:
+            header_block = stream[pos:header_end]
+            start_line, headers = parse_http1_headers(header_block)
+    
+            # Upgrade 响应只改写头部，后续数据交给 WebSocket handler
+            if (
+                is_http_response_line(start_line)
+                and start_line.startswith(b"HTTP/1.1 101")
+                and has_token_header(headers, b"Upgrade", b"websocket")
+            ):
+                new_msg, consumed, label = rewrite_upgrade_header_only(stream, pos, ctx)
+            else:
+                new_msg, consumed, suffix = replace_one_http1_message(stream, pos, ctx)
+                label = f"http1.{suffix}"
+        except RewriteError:
+            new_tail, tail_changed, ext_label = general_replace_payload(rest, args)
+            if tail_changed:
+                changed = True
+                labels.append(f"tail_error_fallback.{ext_label}")
+            output.extend(new_tail)
+            break
 
         old_msg = stream[pos:pos + consumed]
         output.extend(new_msg)

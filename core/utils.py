@@ -47,23 +47,57 @@ def attach_ip_material(args):
 
 IP_TEXT_BOUNDARY_BYTES = b"0123456789."
 IP_COMMA_BOUNDARY_BYTES = b"0123456789,"
+IP_TEXT_TOKEN_BYTES = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_-"
 PRINTABLE_TEXT_BYTES = set(b"\t\r\n" + bytes(range(0x20, 0x7F)))
+
+
+def is_ip_text_match(payload, start, old_len, boundary_bytes=IP_TEXT_BOUNDARY_BYTES):
+    """
+    判断一次 old_ip 命中是否是独立 IPv4 文本。
+    默认 dotted IPv4 规则：
+      - 不允许左右贴着字母/数字/下划线/连字符，避免 token 内误替换；
+      - 不允许贴着数字或数字后缀点，避免 10.0.0.1 命中 10.0.0.10 / 10.0.0.1.5；
+      - 允许句末标点点号，如 "10.0.0.1."。
+    非默认 boundary_bytes 保留原先的简单左右边界语义。
+    """
+    if boundary_bytes != IP_TEXT_BOUNDARY_BYTES:
+        left_ok = start == 0 or payload[start - 1] not in boundary_bytes
+        right = start + old_len
+        right_ok = right == len(payload) or payload[right] not in boundary_bytes
+        return left_ok and right_ok
+
+    if start > 0:
+        left = payload[start - 1]
+        if left in IP_TEXT_TOKEN_BYTES or left == ord("."):
+            return False
+
+    right = start + old_len
+    if right >= len(payload):
+        return True
+
+    right_byte = payload[right]
+    if right_byte in IP_TEXT_TOKEN_BYTES:
+        return False
+    if right_byte != ord("."):
+        return True
+
+    if right + 1 >= len(payload):
+        return True
+    return payload[right + 1] not in IP_TEXT_TOKEN_BYTES
 
 
 def contains_ip_text_boundary(payload, old_ip, boundary_bytes=IP_TEXT_BOUNDARY_BYTES):
     """
     判断 payload 中是否存在带文本边界的 IPv4 字符串。
-    只要求左右字符不是数字或分隔符，避免把 10.0.0.1 匹配进 10.0.0.10。
+    默认按独立 IPv4 文本判断，避免把 10.0.0.1 匹配进 10.0.0.10，
+    同时允许句末 "10.0.0.1." 这类标点场景。
     """
     if not old_ip:
         return False
     pos = payload.find(old_ip)
     old_len = len(old_ip)
     while pos >= 0:
-        left_ok = pos == 0 or payload[pos - 1] not in boundary_bytes
-        right = pos + old_len
-        right_ok = right == len(payload) or payload[right] not in boundary_bytes
-        if left_ok and right_ok:
+        if is_ip_text_match(payload, pos, old_len, boundary_bytes=boundary_bytes):
             return True
         pos = payload.find(old_ip, pos + 1)
     return False
@@ -85,10 +119,8 @@ def replace_ip_text_boundary(payload, old_ip, new_ip, boundary_bytes=IP_TEXT_BOU
         if match < 0:
             out.extend(payload[pos:])
             break
-        left_ok = match == 0 or payload[match - 1] not in boundary_bytes
         right = match + old_len
-        right_ok = right == len(payload) or payload[right] not in boundary_bytes
-        if left_ok and right_ok:
+        if is_ip_text_match(payload, match, old_len, boundary_bytes=boundary_bytes):
             out.extend(payload[pos:match])
             out.extend(new_ip)
             changed = True

@@ -26,6 +26,19 @@ PG_RESULT_FORMAT_QUEUE = "postgresql_result_format_queue"
 PG_CURRENT_RESULT_FORMATS = "postgresql_current_result_formats"
 
 
+def looks_like_postgresql_typed_message(payload):
+    """检查 type+length 消息头是否像 PostgreSQL，避免误吞 FTP PORT 等 P 开头文本。"""
+    if len(payload) < 5 or payload[0] not in {
+        PG_QUERY_MESSAGE,
+        PG_PARSE_MESSAGE,
+        PG_BIND_MESSAGE,
+        PG_DATA_ROW_MESSAGE,
+    }:
+        return False
+    msg_len = int.from_bytes(payload[1:5], "big")
+    return 4 <= msg_len <= len(payload) - 1
+
+
 def read_cstring(data, pos, limit, label):
     """读取 null-terminated PostgreSQL 字符串。"""
     end = data.find(b"\x00", pos, limit)
@@ -306,12 +319,7 @@ class PostgreSQLHandler(ProtocolHandler):
             return False
         if is_port(ctx, POSTGRES_PORT):
             return True
-        return len(payload) >= 6 and payload[0] in {
-            PG_QUERY_MESSAGE,
-            PG_PARSE_MESSAGE,
-            PG_BIND_MESSAGE,
-            PG_DATA_ROW_MESSAGE,
-        }
+        return looks_like_postgresql_typed_message(payload)
 
     def rewrite(self, payload, ctx):
         out = bytearray()

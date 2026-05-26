@@ -37,6 +37,24 @@ def assign_tcp_generations(packets):
     reset_pairs = set()
     ended_directions = set()
     last_seq_end_by_direction = {}
+
+    def advance_generation(pair):
+        """
+        端点复用进入新连接分代，并清理旧连接遗留的方向状态。
+        若只递增 generation 而保留旧方向 SEQ，mid-stream 场景中新连接的另一方向
+        可能再次被旧 SEQ 大跳变启发式拆到下一代。
+        """
+        nonlocal ended_directions
+        generations[pair] = generations.get(pair, 0) + 1
+        reset_pairs.discard(pair)
+        ended_directions = {
+            ended for ended in ended_directions
+            if ended[0] != pair
+        }
+        for cached_direction in list(last_seq_end_by_direction):
+            if cached_direction[0] == pair:
+                del last_seq_end_by_direction[cached_direction]
+
     for index, packet in enumerate(packets):
         if packet is None or not (IP in packet and TCP in packet):
             continue
@@ -54,26 +72,26 @@ def assign_tcp_generations(packets):
         )
         # SYN 且无 ACK = 新连接发起（三次握手第一步）
         if syn and not ack:
-            generations[pair] = generations.get(pair, 0) + 1
-            reset_pairs.discard(pair)
-            ended_directions = {
-                ended for ended in ended_directions
-                if ended[0] != pair
-            }
+            advance_generation(pair)
         elif payload and (pair in reset_pairs or direction in ended_directions):
             # FIN 是半关闭，只结束当前方向；RST 才结束整个四元组。
             # mid-stream 抓包看不到新 SYN 时，结束后同方向新数据视为下一代连接。
-            generations[pair] = generations.get(pair, 0) + 1
-            reset_pairs.discard(pair)
-            ended_directions = {
-                ended for ended in ended_directions
-                if ended[0] != pair
-            }
+            # 防止 FIN+payload 或 RST 之前的包被重传时误当成新连接：
+            is_retransmission = False
+            if direction in last_seq_end_by_direction:
+                gap = (int(packet[TCP].seq) - last_seq_end_by_direction[direction]) % TCP_SEQ_MOD
+                # 如果是近期发送过的数据（回退不超过 1GB），视为重传乱序，不拆代
+                if TCP_SEQ_MOD - _TCP_REUSE_SEQ_GAP <= gap < TCP_SEQ_MOD:
+                    is_retransmission = True
+
+            if not is_retransmission:
+                advance_generation(pair)
         elif payload and direction in last_seq_end_by_direction:
-            # 只把巨大正向跳变作为复用启发式；乱序/重传造成的回退不应拆代。
+            # 巨大正向或巨大反向跳变均视为新连接复用（新连接的 ISN 可能小于旧 SEQ）。
+            # 乱序/重传造成的回退只在合理滑动窗口内，超过则视为新连接。
             forward_gap = (int(packet[TCP].seq) - last_seq_end_by_direction[direction]) % TCP_SEQ_MOD
-            if 0 < forward_gap < TCP_SEQ_HALF and forward_gap >= _TCP_REUSE_SEQ_GAP:
-                generations[pair] = generations.get(pair, 0) + 1
+            if _TCP_REUSE_SEQ_GAP <= forward_gap <= TCP_SEQ_MOD - _TCP_REUSE_SEQ_GAP:
+                advance_generation(pair)
         elif pair not in generations:
             generations[pair] = 0
         packet_generations[index] = generations.get(pair, 0)
@@ -167,8 +185,11 @@ def build_stream_state(key, packet_indices, packets):
     if not payloads:
         return None
 
-    # 以最小 seq 为基准，使偏移计算不受抓包乱序影响
-    base_seq = min(seq for _, seq, _ in payloads)
+    # 在环形空间中找出真正的最早期望 seq
+    base_seq = payloads[0][1]
+    for _, seq, _ in payloads:
+        if (base_seq - seq) % TCP_SEQ_MOD < TCP_SEQ_HALF:
+            base_seq = seq
 
     # stream: 重组后的字节数组；filled: 标记每个位置是否已被写入（0/1）
     stream = bytearray()
